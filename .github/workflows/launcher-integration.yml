@@ -1,0 +1,93 @@
+name: launcher-integration
+
+# Single-edge cross-repo CI: when codetracer-beam-recorder changes,
+# verify the launcher's bundled-hex build still works against this
+# recorder's source. Mirrors the pattern in
+# codetracer-specs/Testing/Cross-Repo-CI-Integration.md.
+#
+# Added as part of the M9 extension that brought BEAM / Hex.pm into
+# the campaign's package-manager matrix alongside the original
+# Python, Ruby, JavaScript trio. The recorder is BEAM-language-
+# agnostic at the recorder layer; the launcher's hex package targets
+# both Elixir and Erlang via the same `codetracer` Hex package name.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  hex-bundling:
+    runs-on: ubuntu-latest
+    name: hex bundling smoke-test
+    steps:
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - uses: actions/checkout@v4
+        with:
+          path: codetracer-beam-recorder
+
+      - uses: metacraft-labs/metacraft-github-actions/clone-repo@main
+        with:
+          repo: metacraft-labs/codetracer-launcher
+          ref: main
+          path: codetracer-launcher
+          gh-token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.4"
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build launcher
+        working-directory: codetracer-launcher
+        run: bash ./build.sh --target linux-musl-x86_64 --out launcher
+
+      - name: Set up Erlang/Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.0'
+          elixir-version: '1.17'
+
+      - name: Pre-install Hex + rebar locally
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Build bundled hex package
+        working-directory: codetracer-launcher/packaging/hex
+        env:
+          CT_LAUNCHER_VERSION: 0.1.0
+          CT_LAUNCHER_BIN: ${{ github.workspace }}/codetracer-launcher/out/launcher
+          CT_LAUNCHER_TARGET: linux-musl-x86_64
+          # codetracer-beam-recorder's Elixir-side source lives at lib/.
+          # The launcher's build_hex.exs vendors this tree under
+          # priv/recorder/ inside the produced .tar.
+          CT_RECORDER_SRC: ${{ github.workspace }}/codetracer-beam-recorder/lib
+        run: elixir build_hex.exs --out dist
+
+      - name: Smoke-test the hex package
+        working-directory: codetracer-launcher/packaging/hex
+        run: |
+          # The hex .tar contains a `contents.tar.gz` that holds the
+          # package payload. We unpack into a sandbox and verify that
+          # the launcher binary under priv/ is invocable. (A full
+          # `mix deps.get` from a local hex would require a Hex
+          # registry mirror; the unpack+invoke is the substantive
+          # smoke-test for the bundled artifact's contents.)
+          sandbox="${RUNNER_TEMP}/hex-sandbox"
+          mkdir -p "$sandbox" && cd "$sandbox"
+          tar -xf "${GITHUB_WORKSPACE}/codetracer-launcher/packaging/hex/dist/codetracer-0.1.0-linux-musl-x86_64.tar"
+          tar -xzf contents.tar.gz
+          out=$(./priv/ct --version)
+          echo "$out"
+          echo "$out" | grep -qE "^ct [0-9]+\.[0-9]+"
