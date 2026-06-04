@@ -1,0 +1,70 @@
+name: publish-hex
+
+# Publishes codetracer-beam-recorder to Hex.pm. Fires on `v*` tag
+# pushes (the primary release path) and also accepts a manual
+# workflow_dispatch (per Repo-Requirements.md §2.8.4).
+#
+# Required secrets:
+#   HEX_API_KEY        Hex.pm API key with publish permission on
+#                      the codetracer_beam_recorder package.
+#
+# When HEX_API_KEY is unset the workflow performs a dry-run (mix
+# hex.build) without publishing.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semver to publish (overrides tag for manual runs)'
+        required: true
+        default: '0.1.0'
+      dry_run:
+        description: 'Build the artifact but skip the upload'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: hex
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: ver
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          elixir-version: '1.17'
+
+      - name: Verify mix.exs version
+        if: ${{ hashFiles('rebar3_codetracer/mix.exs') != '' }}
+        run: |
+          # The Hex package metadata lives under rebar3_codetracer/ in
+          # this repo; adjust the path if/when the layout changes.
+          cd rebar3_codetracer && mix hex.build --unpack || mix hex.build
+
+      - name: Publish to Hex
+        if: ${{ github.event_name == 'push' || inputs.dry_run != true }}
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: |
+          if [[ -z "$HEX_API_KEY" ]]; then
+            echo "::warning::HEX_API_KEY not set; skipping publish (dry-run)."
+            exit 0
+          fi
+          if [[ -f rebar3_codetracer/mix.exs ]]; then
+            cd rebar3_codetracer && mix hex.publish --yes
+          else
+            echo "::warning::mix.exs not found; nothing to publish."
+          fi

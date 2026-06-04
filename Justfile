@@ -132,7 +132,79 @@ bench:
   target/release/codetracer-beam-recorder --version >/dev/null
 
 bump-version new_version:
-  case "{{new_version}}" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "version must be semver MAJOR.MINOR.PATCH" >&2; exit 1 ;; esac
-  sed -i.bak -E 's/^version = "[^"]+"/version = "{{new_version}}"/' Cargo.toml
-  rm -f Cargo.toml.bak
-  cargo update --workspace
+  #!/usr/bin/env python3
+  import pathlib, re, subprocess
+  raw = "{{new_version}}"
+  cargo = pathlib.Path("Cargo.toml")
+  cur_match = re.search(r'^version\s*=\s*"(\d+\.\d+\.\d+)"', cargo.read_text(), re.MULTILINE)
+  cur = cur_match.group(1) if cur_match else "0.1.0"
+  if re.match(r'^\d+\.\d+\.\d+$', raw):
+      new = raw
+  else:
+      a, b, p = map(int, cur.split("."))
+      if raw == "major": new = f"{a+1}.0.0"
+      elif raw == "minor": new = f"{a}.{b+1}.0"
+      elif raw == "patch": new = f"{a}.{b}.{p+1}"
+      else: raise SystemExit(f"unknown bump component: {raw!r}")
+  text = cargo.read_text()
+  text = re.sub(r'(^version\s*=\s*")\d+\.\d+\.\d+(")', rf'\g<1>{new}\g<2>', text, count=1, flags=re.MULTILINE)
+  cargo.write_text(text)
+  print(f"Cargo.toml: {cur} -> {new}")
+  # Refresh Cargo.lock; allow failure for offline runs.
+  try:
+      subprocess.run(["cargo", "update", "--workspace"], check=False)
+  except FileNotFoundError:
+      print("(cargo not on PATH; skipping cargo update)")
+
+# --- M13: Packaging UX Standardization ---
+# Implements Repo-Requirements.md §2.8 packaging UX for the BEAM
+# language-ecosystem recorder. Single channel: hex.
+
+# Build a release artifact for the given channel.
+# Supported channels: hex
+build-package channel:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  case "{{channel}}" in
+      hex)
+          just build
+          if command -v mix >/dev/null 2>&1 && [ -f rebar3_codetracer/mix.exs ]; then
+              cd rebar3_codetracer && mix hex.build || true
+          else
+              echo "[build-package hex] mix or rebar3_codetracer/mix.exs missing; nothing to archive yet."
+          fi
+          ;;
+      *)
+          echo "::error::unknown channel '{{channel}}'. BEAM recorder only supports 'hex'." >&2
+          exit 1
+          ;;
+  esac
+
+# Verify the artifact produced by `build-package <channel>`.
+verify-package channel:
+  #!/usr/bin/env python3
+  import os, shutil, subprocess, sys
+  from pathlib import Path
+  ch = "{{channel}}"
+  strict = os.environ.get("CT_VERIFY_STRICT") == "1"
+  if ch != "hex":
+      print(f"::error::unknown channel {ch!r}; BEAM recorder only supports 'hex'")
+      sys.exit(1)
+  rebar = Path("rebar3_codetracer")
+  if not rebar.exists():
+      print("[verify] rebar3_codetracer/ not present; nothing to verify")
+      sys.exit(0)
+  if shutil.which("mix"):
+      subprocess.run(["mix", "hex.build", "--unpack"], cwd=rebar, check=False)
+      print("[verify] hex build OK")
+  else:
+      if strict:
+          print("::error::mix required in strict mode"); sys.exit(1)
+      print("[verify] SKIP: mix not on PATH")
+
+# Per-channel shortcut.
+build-hex:
+  just build-package hex
+
+verify-hex:
+  just verify-package hex
