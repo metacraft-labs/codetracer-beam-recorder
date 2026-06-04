@@ -28,7 +28,7 @@ defmodule CodetracerBeamRecorder.MixProject do
     [
       name: "codetracer_beam_recorder",
       maintainers: ["Metacraft Labs"],
-      licenses: ["MIT"],
+      licenses: ["Apache-2.0"],
       files: [
         "lib",
         "apps/codetracer_erlang_runtime",
