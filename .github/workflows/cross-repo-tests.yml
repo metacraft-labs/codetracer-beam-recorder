@@ -1,0 +1,367 @@
+# Cross-Repo Integration Tests
+#
+# Validates that changes to this recorder do not break the CodeTracer VS Code
+# extension's BEAM (Elixir + Erlang) DAP and GUI tests.
+#
+# Workspace layout (sibling repos cloned alongside this checkout):
+#   $GITHUB_WORKSPACE/../
+#     codetracer-beam-recorder/      <-- this repo (checked out)
+#     codetracer/                    <-- cloned (for ct binary)
+#     codetracer-vscode-extension/   <-- cloned (test harness + fixtures)
+
+name: Cross-Repo Integration Tests
+
+on:
+  pull_request:
+    branches: [main, dev, stable]
+  push:
+    branches: [main, dev, stable]
+
+  workflow_dispatch:
+    inputs:
+      codetracer_ref:
+        description: 'Git ref for codetracer repo'
+        required: false
+        default: ''
+      vscode_extension_ref:
+        description: 'Git ref for codetracer-vscode-extension repo'
+        required: false
+        default: ''
+
+  repository_dispatch:
+    types: [cross-repo-test]
+
+jobs:
+  wdio-integration:
+    runs-on: [self-hosted, nixos]
+
+    steps:
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Configure NIX_CONFIG with access-tokens
+        # The original top-level ``env: NIX_CONFIG`` block referenced
+        # ``steps.app-token.outputs.token`` -- but the ``steps`` context
+        # is unavailable at workflow level (the new GitHub Actions
+        # validator rejects the file before any job starts).  Set
+        # ``NIX_CONFIG`` via ``$GITHUB_ENV`` from a step that runs
+        # AFTER ``app-token`` so subsequent ``nix develop`` invocations
+        # can still fetch private flake inputs.
+        run: |
+          {
+            echo 'NIX_CONFIG<<NIX_EOF'
+            echo "access-tokens = github.com=${{ steps.app-token.outputs.token }}"
+            echo 'accept-flake-config = true'
+            echo 'NIX_EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: metacraft-labs/metacraft-github-actions/setup-nix@main
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          cachix-cache: ''
+          trusted-public-keys: ''
+          substituters: ''
+          gh-token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      # Resolve sibling refs using priority cascade:
+      #   1. workflow_dispatch input (manual override)
+      #   2. repository_dispatch payload (bidirectional trigger)
+      #   3. .github/sibling-pins (pinned SHAs)
+      #   4. Fallback to main
+      - name: Resolve sibling refs
+        id: resolve-refs
+        run: |
+          resolve_ref() {
+            local name="$1" dispatch_input="$2" payload_field="$3"
+
+            if [ -n "$dispatch_input" ]; then
+              echo "$dispatch_input"; return
+            fi
+            if [ -n "$payload_field" ]; then
+              echo "$payload_field"; return
+            fi
+            if [ -f .github/sibling-pins ]; then
+              local ref
+              ref="$(grep "^${name} " .github/sibling-pins | cut -d' ' -f2)" || true
+              if [ -n "$ref" ]; then
+                echo "$ref"; return
+              fi
+            fi
+            echo "main"
+          }
+
+          CT_REF=$(resolve_ref codetracer \
+            "${{ github.event.inputs.codetracer_ref }}" \
+            "${{ github.event.client_payload.codetracer_ref }}")
+          EXT_REF=$(resolve_ref codetracer-vscode-extension \
+            "${{ github.event.inputs.vscode_extension_ref }}" \
+            "${{ github.event.client_payload.vscode_extension_ref }}")
+
+          resolve_branch() {
+            local name="$1"
+            if [ -f .github/sibling-pins ]; then
+              local branch
+              branch="$(grep "^${name} " .github/sibling-pins | cut -d' ' -f3)" || true
+              if [ -n "$branch" ]; then
+                echo "$branch"; return
+              fi
+            fi
+            echo "main"
+          }
+
+          echo "codetracer_ref=$CT_REF" >> "$GITHUB_OUTPUT"
+          echo "vscode_extension_ref=$EXT_REF" >> "$GITHUB_OUTPUT"
+          EXT_BRANCH=$(resolve_branch codetracer-vscode-extension)
+          echo "vscode_extension_branch=$EXT_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Resolved refs: codetracer=$CT_REF, vscode-extension=$EXT_REF (branch=$EXT_BRANCH)"
+
+      - name: Clone codetracer
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          CT_REF="${{ steps.resolve-refs.outputs.codetracer_ref }}"
+          DEST="$GITHUB_WORKSPACE/../codetracer"
+          rm -rf "$DEST"
+          # Clone without submodules first, then init them individually.
+          # --recurse-submodules fails when submodule SHAs are unreachable
+          # (force-pushed or rebased upstream). Individual init+update is
+          # more resilient: we can skip submodules that fail.
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer.git" \
+            "$DEST"
+          cd "$DEST"
+          git submodule init
+          # Rewrite submodule URLs with auth token for private repos
+          for url in $(git config --get-regexp '^submodule\..*\.url$' \
+                       | grep -E 'git@github\.com:|https://github\.com/' \
+                       | cut -d' ' -f1); do
+            old_url=$(git config --get "$url")
+            new_url=$(echo "$old_url" \
+              | sed "s|git@github.com:|https://x-access-token:${GH_TOKEN}@github.com/|" \
+              | sed "s|https://github.com/|https://x-access-token:${GH_TOKEN}@github.com/|")
+            git config "$url" "$new_url"
+          done
+          # Update submodules one by one, skipping failures (some pinned
+          # SHAs may be unreachable). The critical submodule for WDIO tests
+          # is tree-sitter-nim; others are optional.
+          # Temporarily disable errexit so failed submodule clones don't
+          # abort the entire step.
+          set +e
+          git config --get-regexp '^submodule\..*\.url$' | cut -d. -f2 | while read -r mod; do
+            echo "Updating submodule: $mod"
+            git \
+              -c "url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf=https://github.com/" \
+              submodule update --init --recursive --depth 1 -- "$mod" 2>&1
+            rc=$?
+            if [ $rc -ne 0 ]; then
+              echo "::warning::submodule $mod failed to update (rc=$rc, non-fatal)"
+            fi
+          done
+          set -e
+          cd -
+          if [ "$CT_REF" != "main" ]; then
+            git -C "$DEST" fetch origin "$CT_REF"
+            # Use FETCH_HEAD so the checkout works for both SHAs and
+            # branch names.  ``git checkout <branch>`` would fail with
+            # ``pathspec '<branch>' did not match any file(s) known to
+            # git`` because the initial ``--depth 1`` clone above
+            # doesn't track remote branches; ``FETCH_HEAD`` is the
+            # ref that ``git fetch origin <ref>`` always populates.
+            # The vscode-extension clone block (below) already uses
+            # this pattern -- this brings codetracer into line.
+            git -C "$DEST" checkout FETCH_HEAD
+          fi
+
+      - name: Clone codetracer-vscode-extension
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          EXT_REF="${{ steps.resolve-refs.outputs.vscode_extension_ref }}"
+          EXT_BRANCH="${{ steps.resolve-refs.outputs.vscode_extension_branch }}"
+          DEST="$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          rm -rf "$DEST"
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-vscode-extension.git" \
+            "$DEST"
+          if [ "$EXT_BRANCH" != "main" ]; then
+            git -C "$DEST" fetch origin "$EXT_BRANCH"
+            git -C "$DEST" checkout FETCH_HEAD
+          fi
+
+      - name: Clone codetracer-trace-format as recorder Cargo sibling
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        # The recorder's Cargo.toml declares
+        # `codetracer_trace_types` / `codetracer_trace_writer_nim` as
+        # path deps at `../codetracer-trace-format/...`.  Any step
+        # that runs `cargo` against this checkout (the fixture-
+        # recording step shells out to the recorder's nix shell
+        # via `recorder_exec`, which cargo-builds the recorder)
+        # needs the sibling on disk at the same level as the
+        # recorder.
+        run: |
+          PINS="$GITHUB_WORKSPACE/.github/sibling-pins"
+          TF_REF="main"
+          if [ -f "$PINS" ]; then
+            PIN_REF="$(grep '^codetracer-trace-format ' "$PINS" | cut -d' ' -f2)" || true
+            [ -n "$PIN_REF" ] && TF_REF="$PIN_REF"
+          fi
+          DEST="$GITHUB_WORKSPACE/../codetracer-trace-format"
+          rm -rf "$DEST"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" "$DEST"
+          git -C "$DEST" checkout "$TF_REF"
+
+      - name: Clone codetracer-trace-format-nim as recorder sibling
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        # codetracer_trace_writer_nim's build.rs reads the FFI
+        # entry point at
+        # `../codetracer-trace-format-nim/src/codetracer_trace_writer_ffi.nim`.
+        # The fixture-recording step's recorder_exec cargo-builds
+        # the recorder, which compiles codetracer_trace_writer_nim,
+        # which panics without this sibling on disk.
+        run: |
+          PINS="$GITHUB_WORKSPACE/.github/sibling-pins"
+          TFN_REF="main"
+          if [ -f "$PINS" ]; then
+            PIN_REF="$(grep '^codetracer-trace-format-nim ' "$PINS" | cut -d' ' -f2)" || true
+            [ -n "$PIN_REF" ] && TFN_REF="$PIN_REF"
+          fi
+          DEST="$GITHUB_WORKSPACE/../codetracer-trace-format-nim"
+          rm -rf "$DEST"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format-nim.git" "$DEST"
+          git -C "$DEST" checkout "$TFN_REF" 2>/dev/null || true
+
+      - name: Clone codetracer-trace-format into codetracer/libs (CI override)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        # The codetracer Build step below uses
+        # ``--override-input codetracer-trace-format
+        # path:./libs/codetracer-trace-format``.  The codetracer
+        # checkout doesn't ship that directory, so we clone the
+        # sibling pin into the expected path before nix build.
+        run: |
+          PINS="$GITHUB_WORKSPACE/.github/sibling-pins"
+          TF_REF="main"
+          if [ -f "$PINS" ]; then
+            PIN_REF="$(grep '^codetracer-trace-format ' "$PINS" | cut -d' ' -f2)" || true
+            [ -n "$PIN_REF" ] && TF_REF="$PIN_REF"
+          fi
+          DEST="$GITHUB_WORKSPACE/../codetracer/libs/codetracer-trace-format"
+          rm -rf "$DEST"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git" "$DEST"
+          git -C "$DEST" checkout "$TF_REF"
+
+      - name: Build codetracer
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer"
+          OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format"
+          # ``metacraft-labs-codetracer.cachix.org`` serves a stale
+          # narinfo for the noir flake input keyed under a NAR-hash
+          # that no longer matches the lockfile, so the build aborts
+          # with ``NAR hash mismatch in input git+https://...noir...``.
+          # Force-skip every non-default substituter (``cache.nixos.org``
+          # alone is plenty for the standard nixpkgs paths) so nix
+          # fetches the noir source from origin and computes the
+          # correct hash itself.  Documented as CI-stabilization §4.
+          SUBST_OVERRIDE="--option accept-flake-config false --option substituters https://cache.nixos.org"
+          # The runner's per-user fetcher cache
+          # (~/.cache/nix/fetcher-cache-v2.sqlite) holds a stale
+          # narinfo for the noir git+https input that contradicts the
+          # lockfile.  ``--refresh`` forces nix to re-resolve every
+          # flake input from origin even when the local cache has an
+          # entry, so the cached narHash gets replaced by what
+          # upstream currently serves.
+          REFRESH="--refresh"
+          nix build $SUBST_OVERRIDE $REFRESH -L ".?submodules=1#codetracer" $OVERRIDE -o result-ct
+          nix build $SUBST_OVERRIDE -L ".?submodules=1#db-backend" $OVERRIDE -o result-db
+          # Merge both outputs into a single bin directory so the extension
+          # can find both ct and db-backend via a single runnablePath.
+          mkdir -p combined-bin
+          ln -sf "$PWD"/result-ct/bin/* combined-bin/
+          ln -sf "$PWD"/result-db/bin/* combined-bin/
+          echo "$PWD/combined-bin" >> "$GITHUB_PATH"
+
+      - name: Install extension dependencies
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          nix develop -c just install
+
+      - name: Compile extension TypeScript
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          nix develop -c just compile-ts
+
+      - name: Restore Nim-compiled ct_vscode.js
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          if [ -f media/ct_vscode.js ]; then
+            cp media/ct_vscode.js out/ct_vscode.js
+          fi
+
+      - name: Patch runnablePath for CI
+        run: |
+          CT_BIN="$GITHUB_WORKSPACE/../codetracer/combined-bin/ct"
+          SETTINGS="$GITHUB_WORKSPACE/../codetracer-vscode-extension/test/wdio/projects/stylus-test/.vscode/settings.json"
+          mkdir -p "$(dirname "$SETTINGS")"
+          echo "{\"codetracer.runnablePath\": \"$CT_BIN\"}" > "$SETTINGS"
+          echo "Patched runnablePath to: $CT_BIN"
+
+      - name: Record BEAM trace fixtures
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          # ``prepare-beam-fixture.sh`` is a thin wrapper around the
+          # recorder-owned ``scripts/prepare-beam-fixtures.sh`` (note
+          # the plural ``fixtures``) — it records both Elixir and
+          # Erlang ``canonical_flow`` programs so the WDIO smoke +
+          # deep BEAM specs each find a real CTFS bundle under
+          # ``test/traces/{elixir,erlang}-canonical-flow/``.
+          FORCE=1 bash scripts/prepare-beam-fixture.sh
+
+      - name: Run Elixir smoke tests
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          nix develop -c just _xvfb-run \
+            "npx wdio run wdio.conf.ts --spec test/wdio/specs/smoke/elixir.e2e.ts"
+
+      - name: Run Erlang smoke tests
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          nix develop -c just _xvfb-run \
+            "npx wdio run wdio.conf.ts --spec test/wdio/specs/smoke/erlang.e2e.ts"
+
+      - name: Run BEAM deep tests
+        run: |
+          cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          nix develop -c just _xvfb-run \
+            "npx wdio run wdio.conf.ts --spec test/wdio/specs/deep/beam-deep.e2e.ts"
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          EXT_DIAG="$GITHUB_WORKSPACE/../codetracer-vscode-extension/test/wdio/diagnostics"
+          if [ -d "$EXT_DIAG" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics"
+            cp -r "$EXT_DIAG"/* "$GITHUB_WORKSPACE/wdio-diagnostics/"
+          fi
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdio-beam-diagnostics
+          path: wdio-diagnostics/
+          retention-days: 7
+          if-no-files-found: ignore

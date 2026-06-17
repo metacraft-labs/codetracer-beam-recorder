@@ -1,0 +1,14 @@
+# Sibling-repo pinning for cross-repo integration tests.
+#
+# Format: <repo-name> <git-ref> <branch-name>
+#   - <git-ref>:    SHA or branch name to fetch + checkout in CI.
+#   - <branch-name>: branch the ref lives on (used by the workflow's
+#                    "is it main?" guard).
+#
+# Pinning ``codetracer`` and ``codetracer-trace-format`` to ``dev``
+# matches codetracer-solana-recorder so this recorder picks up the
+# latest db-backend + trace-format APIs the WDIO suite expects.
+codetracer dev dev
+codetracer-vscode-extension main main
+codetracer-trace-format dev dev
+codetracer-trace-format-nim main main
