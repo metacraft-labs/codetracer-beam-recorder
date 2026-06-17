@@ -107,6 +107,16 @@
                 erlang
                 just
                 jq
+                # nim + nimble are required by the
+                # ``codetracer_trace_writer_nim`` crate's build.rs --
+                # without them, ``cargo build`` aborts with::
+                #   failed to run `nimble` -- it ships with the Nim
+                #   toolchain and must be on PATH alongside `nim`
+                # (cross-repo run 27678456790).  Match the
+                # solana/leo recorder flakes which keep these in
+                # the devShell for the same reason.
+                nim
+                nimble
                 nixfmt
                 pkg-config
                 prek
