@@ -319,6 +319,17 @@ jobs:
           echo "{\"codetracer.runnablePath\": \"$CT_BIN\"}" > "$SETTINGS"
           echo "Patched runnablePath to: $CT_BIN"
 
+      - name: Build beam recorder binary
+        run: |
+          # ``prepare-beam-fixtures.sh`` expects the recorder binary
+          # to already exist (or for cargo to be on PATH so its
+          # self-bootstrap can ``cargo build --locked``).  The
+          # workflow shell after ``Install Nix`` has neither cargo
+          # nor BEAM tools available, so do the build inside the
+          # recorder's nix devShell where they are.
+          cd "$GITHUB_WORKSPACE"
+          nix develop --accept-flake-config -c cargo build --release
+
       - name: Record BEAM trace fixtures
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
@@ -328,6 +339,12 @@ jobs:
           # Erlang ``canonical_flow`` programs so the WDIO smoke +
           # deep BEAM specs each find a real CTFS bundle under
           # ``test/traces/{elixir,erlang}-canonical-flow/``.
+          # Hand the pre-built recorder binary to the fixture
+          # script via ``CODETRACER_BEAM_RECORDER_BIN`` so it
+          # skips the cargo-build self-bootstrap that won't work
+          # outside the recorder's nix shell.
+          export CODETRACER_BEAM_RECORDER_BIN="$GITHUB_WORKSPACE/target/release/codetracer-beam-recorder"
+          export CODETRACER_BEAM_RECORDER_PATH="$GITHUB_WORKSPACE"
           FORCE=1 bash scripts/prepare-beam-fixture.sh
 
       - name: Run Elixir smoke tests
