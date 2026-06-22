@@ -74,16 +74,6 @@ require_just_recipe() {
   fi
 }
 
-require_json_sha() {
-  local repo="$1"
-  local sha="$2"
-  if grep -Eq "\"$repo\"[[:space:]]*:[[:space:]]*\"$sha\"" .github/sibling-pins.json; then
-    pass "sibling pin $repo is $sha"
-  else
-    fail "sibling pin $repo does not match $sha"
-  fi
-}
-
 require_file flake.nix
 require_file .envrc
 require_file Justfile
@@ -91,7 +81,6 @@ require_file AGENTS.md
 require_file Cargo.toml
 require_file Cargo.lock
 require_file .github/workflows/ci.yml
-require_file .github/sibling-pins.json
 require_executable tests/verify-repo-requirements.sh
 require_executable tests/verify-golden-contract.sh
 require_executable tests/verify-trace-format-dependency.sh
@@ -139,9 +128,6 @@ else
 fi
 
 require_text Justfile 'bump-version new_version:' "Justfile has bump-version recipe"
-
-require_json_sha codetracer 1cf386d69b53dd2c5bf9ec84fb87581e35404822
-require_json_sha codetracer-trace-format c5dc5a9f79ca3be03e4d865cd1779ef823b21071
 
 require_text src/main.rs 'codetracer-beam-recorder' "CLI binary identifies recorder name"
 require_text src/main.rs '--out-dir' "CLI help documents --out-dir"

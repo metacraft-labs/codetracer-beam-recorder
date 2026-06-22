@@ -16,11 +16,14 @@ set -euo pipefail
 #   6. The recorder binary builds.
 #   7. The recorder binary surfaces the same version as Cargo.toml on
 #      `--version`.
-#   8. Sibling pins for the downstream regression set
-#      (codetracer-trace-format, codetracer, codetracer-vscode-extension)
-#      are present in .github/sibling-pins.json. Real downstream
-#      regression command surfaces are listed; actual cross-repo runs
-#      are scoped to CI.
+#
+# Sibling revisions for the downstream regression set
+# (codetracer-trace-format, codetracer, codetracer-vscode-extension) are
+# resolved by CI through the repo-workspaces workspace lock
+# (scripts/resolve-sibling-rev.sh); the legacy committed sibling-pin
+# files are forbidden by the canonical repo requirements
+# (runquota/scripts/check_repo_requirements.sh) and are no longer checked
+# here.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -171,22 +174,12 @@ if ! echo "$cli_version_line" | grep -Fq "$cargo_version"; then
 fi
 ok "$cli_version_line"
 
-# ---------- 8. Downstream regression pins ----------
-bold "Downstream regression sibling pins"
-pins="$repo_root/.github/sibling-pins.json"
-[[ -f "$pins" ]] || fail ".github/sibling-pins.json missing"
-
-for sibling in codetracer-trace-format codetracer codetracer-vscode-extension; do
-  grep -Fq "\"$sibling\"" "$pins" ||
-    fail "$pins must include sibling pin for $sibling (downstream regression target)"
-  ok "$sibling sibling pin present"
-done
-
-# Real downstream regression suites are run by CI through the pinned
-# siblings; see scripts/restore-siblings.sh in repo-workspaces. The
-# release-check script confirms the integration surface (the pins) is
-# in place locally; flipping pins to "checked out from
-# codetracer-trace-format directly" is the responsibility of CI.
+# Real downstream regression suites are run by CI through the
+# workspace-locked siblings, resolved via
+# scripts/resolve-sibling-rev.sh against the repo-workspaces workspace
+# lock. The legacy committed sibling-pin files are forbidden by the
+# canonical repo requirements (runquota/scripts/check_repo_requirements.sh),
+# so release-check no longer asserts their presence.
 
 bold "Release readiness summary"
 ok "all release-check assertions held for version $cargo_version"
