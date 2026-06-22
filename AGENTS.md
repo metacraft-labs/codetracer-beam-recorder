@@ -19,8 +19,10 @@ in later milestones.
 - `flake.nix` defines the shared Nix dev shell, package exports, and git hooks.
 - `Cargo.toml`, `Cargo.lock`, and `src/` hold the minimal recorder CLI package.
 - `.github/workflows/ci.yml` mirrors the Just targets used locally.
-- `.github/sibling-pins.json` pins public CodeTracer sibling repos for future
-  cross-repo CI.
+- Cross-repo CI resolves public CodeTracer sibling revisions from the
+  repo-workspaces workspace lock via `scripts/resolve-sibling-rev.sh` (no
+  repo-local sibling-pins file). See
+  `codetracer-specs/Testing/Cross-Repo-CI-Integration.md`.
 - `tests/verify-repo-requirements.sh` is the executable compliance harness.
 
 ## Conventions
