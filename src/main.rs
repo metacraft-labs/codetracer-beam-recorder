@@ -359,9 +359,13 @@ fn resolve_target_command(program: &str) -> Option<PathBuf> {
 }
 
 /// Returns `true` for a Windows batch launcher (`.bat` / `.cmd`).
+#[allow(dead_code)]
 fn is_windows_batch(path: &Path) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
         Some("bat") | Some("cmd")
     )
 }
@@ -3235,7 +3239,11 @@ const BUILD_MANIFEST_FILENAMES: [&str; 3] = ["mix.exs", "rebar.config", "Makefil
 fn is_build_manifest(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .map(|name| BUILD_MANIFEST_FILENAMES.iter().any(|manifest| name.eq_ignore_ascii_case(manifest)))
+        .map(|name| {
+            BUILD_MANIFEST_FILENAMES
+                .iter()
+                .any(|manifest| name.eq_ignore_ascii_case(manifest))
+        })
         .unwrap_or(false)
 }
 
