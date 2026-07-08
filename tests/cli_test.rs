@@ -7,8 +7,12 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codetracer_ctfs::CtfsReader;
+use codetracer_trace_reader::call_stream_reader::CallStreamReader;
+use codetracer_trace_reader::value_stream_reader::ValueStreamReader;
+use codetracer_trace_writer::call_stream::VOID_RETURN_MARKER;
+use codetracer_trace_writer::value_stream::ValueStreamEvent;
 use codetracer_trace_types::{
-    FullValueRecord, TraceLowLevelEvent, TypeKind, TypeRecord, ValueRecord,
+    TraceLowLevelEvent, TypeKind, TypeRecord, ValueRecord,
 };
 use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use serde_json::Value;
@@ -1042,34 +1046,29 @@ fn raw_ctfs_call_return_values(out_dir: &Path) -> Vec<String> {
         "expected CTFS trace at {}",
         ct_path.display()
     );
+    // Decode the dedicated split-stream call table (`calls.dat` + `calls.idx`,
+    // chunked-Zstd, seekable-zstd.md layout) through the reader library rather
+    // than the retired flat `calls.off` offset sidecar. Each call record carries
+    // its return value as a CBOR `ValueRecord`; a single `VOID_RETURN_MARKER`
+    // byte means a void return, which has no textual value to surface.
     let mut reader = CtfsReader::open(&ct_path).expect("open CTFS container");
-    let calls = reader.read_file("calls.dat").expect("read CTFS calls.dat");
-    let offsets = reader.read_file("calls.off").expect("read CTFS calls.off");
-    call_record_slices(&calls, &offsets)
+    let mut call_stream = CallStreamReader::open(&mut reader)
+        .expect("open CTFS call stream")
+        .expect("CTFS trace should carry a dedicated calls.dat call stream");
+    call_stream
+        .read_all()
+        .expect("read CTFS call records")
         .into_iter()
+        .filter(|record| record.return_value != [VOID_RETURN_MARKER])
         .map(|record| {
-            decode_first_value_record(record).unwrap_or_else(|| {
-                panic!("call record should contain a CBOR return value: {record:02x?}")
+            decode_first_value_record(&record.return_value).unwrap_or_else(|| {
+                panic!(
+                    "call record should contain a CBOR return value: {:02x?}",
+                    record.return_value
+                )
             })
         })
         .map(|value| trace_value_text(&value))
-        .collect()
-}
-
-fn call_record_slices<'a>(calls: &'a [u8], offsets: &[u8]) -> Vec<&'a [u8]> {
-    let mut parsed_offsets = offsets
-        .chunks_exact(8)
-        .map(|chunk| {
-            let mut bytes = [0_u8; 8];
-            bytes.copy_from_slice(chunk);
-            u64::from_le_bytes(bytes) as usize
-        })
-        .collect::<Vec<_>>();
-    parsed_offsets.retain(|offset| *offset <= calls.len());
-    parsed_offsets
-        .windows(2)
-        .filter_map(|window| calls.get(window[0]..window[1]))
-        .filter(|record| !record.is_empty())
         .collect()
 }
 
@@ -1310,80 +1309,41 @@ fn reader_value_pairs(out_dir: &Path, trace_file: &str) -> Vec<(String, i64)> {
 fn raw_ctfs_value_pairs(out_dir: &Path, trace_file: &str) -> Vec<(String, i64)> {
     let ct_path = out_dir.join(trace_file);
     let mut reader = CtfsReader::open(&ct_path).expect("open CTFS container");
-    let values = reader.read_file("values.dat").expect("read values.dat");
-    let offsets = reader.read_file("values.off").expect("read values.off");
     let varnames = raw_ctfs_varnames(&mut reader);
-    let mut pairs = Vec::new();
-    for record in call_record_slices(&values, &offsets) {
-        if std::env::var("DEBUG_M9_VALUES").is_ok() {
-            eprintln!("value record bytes: {record:02x?}");
-        }
-        let nim_pairs = decode_nim_value_record(record, &varnames);
-        if !nim_pairs.is_empty() {
-            pairs.extend(nim_pairs);
-            continue;
-        }
-        if let Ok(full_values) =
-            cbor4ii::serde::from_reader::<Vec<FullValueRecord>, _>(Cursor::new(record))
-        {
-            for full in full_values {
-                if let Some(name) = varnames.get(full.variable_id.0) {
-                    if let Some(value) = value_record_int(&full.value) {
-                        pairs.push((name.clone(), value));
-                    }
-                }
-            }
-            continue;
-        }
-        if let Ok(full) = cbor4ii::serde::from_reader::<FullValueRecord, _>(Cursor::new(record)) {
-            if let Some(name) = varnames.get(full.variable_id.0) {
-                if let Some(value) = value_record_int(&full.value) {
-                    pairs.push((name.clone(), value));
-                }
-            }
-            continue;
-        }
-        for offset in 0..record.len() {
-            if let Ok(full) =
-                cbor4ii::serde::from_reader::<FullValueRecord, _>(Cursor::new(&record[offset..]))
-            {
-                if let Some(name) = varnames.get(full.variable_id.0) {
-                    if let Some(value) = value_record_int(&full.value) {
-                        pairs.push((name.clone(), value));
-                    }
-                }
-                break;
-            }
-        }
-    }
-    pairs
-}
-
-fn decode_nim_value_record(record: &[u8], varnames: &[String]) -> Vec<(String, i64)> {
-    if record.len() < 5 || record[0] == 0 {
+    // Decode the dedicated split-stream value table (`values.dat` +
+    // `values.idx`, chunked-Zstd, parallel-indexed to the execution stream)
+    // through the reader library rather than the retired flat `values.off`
+    // offset sidecar. Each value record is a sequence of tagged value-stream
+    // events; per-step variable values live in the `StepValues` event as
+    // `(name_id, CBOR ValueRecord)` pairs.
+    let Some(mut value_stream) =
+        ValueStreamReader::open(&mut reader).expect("open CTFS value stream")
+    else {
         return Vec::new();
-    }
-    let count = usize::from(record[0]);
-    let mut cursor = 1;
+    };
+    let entries = value_stream.read_all().expect("read CTFS value records");
     let mut pairs = Vec::new();
-    for _ in 0..count {
-        if cursor + 3 > record.len() {
-            break;
-        }
-        let variable_id = usize::from(record[cursor]);
-        let cbor_len = usize::from(record[cursor + 2]);
-        let cbor_start = cursor + 3;
-        let cbor_end = cbor_start + cbor_len;
-        let Some(cbor) = record.get(cbor_start..cbor_end) else {
-            break;
-        };
-        if let Ok(json) = cbor4ii::serde::from_reader::<Value, _>(Cursor::new(cbor)) {
-            if let (Some(name), Some(value)) = (varnames.get(variable_id), reader_value_int(&json))
-            {
-                pairs.push((name.clone(), value));
+    for entry in entries {
+        for event in entry.events {
+            let ValueStreamEvent::StepValues { values } = event else {
+                continue;
+            };
+            for (name_id, cbor) in values {
+                if std::env::var("DEBUG_M9_VALUES").is_ok() {
+                    eprintln!("value record bytes: name_id={name_id} {cbor:02x?}");
+                }
+                let Ok(value) =
+                    cbor4ii::serde::from_reader::<ValueRecord, _>(Cursor::new(&cbor[..]))
+                else {
+                    continue;
+                };
+                if let (Some(name), Some(int)) =
+                    (varnames.get(name_id as usize), value_record_int(&value))
+                {
+                    pairs.push((name.clone(), int));
+                }
             }
         }
-        cursor = cbor_end;
     }
     pairs
 }
@@ -1395,9 +1355,29 @@ fn raw_ctfs_varnames(reader: &mut CtfsReader) -> Vec<String> {
     let Ok(offsets) = reader.read_file("varnames.off") else {
         return Vec::new();
     };
-    call_record_slices(&varnames, &offsets)
+    varname_record_slices(&varnames, &offsets)
         .into_iter()
         .map(|record| String::from_utf8_lossy(record).to_string())
+        .collect()
+}
+
+/// Slice a CTFS interning table (`<name>.dat` + `<name>.off`) into its records.
+/// The interning tables keep the Variable-Size Record Table layout: `.off` is a
+/// flat little-endian `u64` array of `record_count + 1` byte offsets into `.dat`
+/// (the trailing sentinel is the total data length), so record `i` spans
+/// `offsets[i]..offsets[i + 1]`.
+fn varname_record_slices<'a>(dat: &'a [u8], offsets: &[u8]) -> Vec<&'a [u8]> {
+    let parsed = offsets
+        .chunks_exact(8)
+        .map(|chunk| {
+            let mut bytes = [0_u8; 8];
+            bytes.copy_from_slice(chunk);
+            u64::from_le_bytes(bytes) as usize
+        })
+        .collect::<Vec<_>>();
+    parsed
+        .windows(2)
+        .filter_map(|window| dat.get(window[0]..window[1]))
         .collect()
 }
 
