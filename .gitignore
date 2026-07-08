@@ -2,6 +2,8 @@
 /result
 /result-*
 /.direnv/
+# reprobuild build artifacts
+.repro/
 /.pre-commit-config.yaml
 /_build/
 /erl_crash.dump
