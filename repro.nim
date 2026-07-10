@@ -56,7 +56,7 @@
 ## ``sh.shell`` execute edges enrolled into the ``test`` collection,
 ## mirroring how the cairo / leo recorders model their non-cargo
 ## verification steps: the canonical-flow fixtures
-## (``test-elixir`` / ``test-erlang``), the CLI smoke check, the twelve
+## (``test-elixir`` / ``test-erlang``), the CLI smoke check, the thirteen
 ## live-BEAM Elixir integration suites, and the fifteen
 ## ``verify-*-no-silent-skip.sh`` structural gates. The integration edges
 ## drive the DEBUG recorder binary (see ``recorderDebugBuild`` below) to
@@ -64,7 +64,7 @@
 ## debug profile and whose step-granularity assertions differ under
 ## release optimisation.
 ##
-## **Serial pool for the heavy live-BEAM edges (FUP-E3).** The twelve
+## **Serial pool for the heavy live-BEAM edges (FUP-E3).** The thirteen
 ## live-BEAM integration suites plus the two canonical-flow fixtures each
 ## spin up a live BEAM VM. Run at the engine's default 8-way parallelism —
 ## competing with cold cargo builds and with one another — they blow past
@@ -82,7 +82,7 @@
 ## ~5x wall-clock to these recorder-heavy suites (``native_tracer_parity``
 ## runs ~11s unmonitored but ~60s under the shim), so even an edge running
 ## essentially alone can exceed the default 60000ms per-test budget. So
-## (2) the twelve MONITORED integration edges are additionally given a
+## (2) the thirteen MONITORED integration edges are additionally given a
 ## generous 300000ms (5 min) per-test ExUnit timeout, set purely on the
 ## edge command via ``elixir -e`` (see the loop below) — the ``.exs`` test
 ## files stay BYTE-IDENTICAL and the unmonitored ``just test`` path keeps
@@ -92,19 +92,18 @@
 ## ``verify-*-no-silent-skip.sh`` gates, the CLI smoke edge, and the cargo
 ## build/test edges — stay UNPOOLED and parallel.
 ##
-## ONE integration suite is intentionally NOT enrolled:
-## ``tests/integration/function_trace_test.exs``. Two of its three
-## subtests (``e2e_runtime_records_canonical_call_return_sequence`` and
-## ``e2e_runtime_call_trace_reader_roundtrip``) assert
-## ``call_function_ids == [compute_id, main_id]`` (completion order) but
-## the recorder emits ``[main, compute]`` (call-entry order); this fails
-## deterministically on unmodified test files, under BOTH debug and
-## release, with and without the reprobuild monitor. It is a pre-existing
-## recorder/test drift (not an env or provisioning gap) reserved for a
-## follow-up milestone; it is left out rather than weakened. Its
-## structural ``verify-function-trace-test-no-silent-skip`` gate — which
-## only asserts the test file is present and Justfile-wired — stays
-## enrolled and green.
+## All thirteen live-BEAM integration suites are enrolled, including
+## ``tests/integration/function_trace_test.exs`` (re-included in FUP-L).
+## Two of its subtests assert ``call_function_ids`` ordering; they now
+## assert the spec-correct CALL-ENTRY order ``[main, compute]`` that the
+## recorder emits — a call record's ``call_key`` is assigned at call entry
+## (``codetracer_trace_writer/call_stream.rs`` ``CallStreamBuilder.observe``
+## pushes the record with ``call_key = records.len()`` on the ``Call``
+## event; the matching ``Return`` only finalizes the record's contents in
+## place, and ``finish()`` returns records in ``call_key`` order). The
+## earlier "completion order" expectation was a stale (CMP-M4-era) test
+## bug, corrected in FUP-L; the recorder was NOT touched. Its structural
+## ``verify-function-trace-test-no-silent-skip`` gate stays enrolled too.
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
 ## canonical Rust-recorder recipes: the nix dev shell puts ``cargo`` /
@@ -190,7 +189,7 @@ package codetracer_beam_recorder:
     # process (``tests/cli_test.rs`` ``e2e_*`` compile+record real Erlang
     # and Elixir programs), of the golden-contract shell script, and of
     # the BEAM/OTP integration ``sh.shell`` edges below (the
-    # canonical-flow fixtures and the twelve live-BEAM Elixir suites drive
+    # canonical-flow fixtures and the thirteen live-BEAM Elixir suites drive
     # ``mix`` / ``elixir`` / ``erl`` / ``erlc`` / ``rebar3`` as child
     # processes); they are supplied to those child processes by the same
     # nix dev shell PATH the flake provides — exactly as ``just test``
@@ -298,13 +297,13 @@ package codetracer_beam_recorder:
     #
     # These re-include the deferred BEAM/OTP portion of ``just test``:
     # ``test-elixir`` / ``test-erlang`` (canonical-flow fixtures), the
-    # CLI smoke check, the twelve live-BEAM Elixir integration suites, and
+    # CLI smoke check, the thirteen live-BEAM Elixir integration suites, and
     # the fifteen ``verify-*-no-silent-skip.sh`` structural gates. Each is
     # a native ``sh.shell`` edge under the engine's automatic monitor, so
     # the real ``elixir`` / ``mix`` / ``erl`` / ``erlc`` / ``rebar3``
     # subprocesses (inherited from the nix dev-shell PATH) are observed —
     # mirroring how the cairo / leo recorders model non-cargo verification
-    # steps. See the docstring for the ``function_trace_test`` exclusion.
+    # steps.
 
     # Debug recorder build for the integration edges: ``just
     # test-integration`` builds the DEBUG profile (``cargo build
@@ -388,13 +387,16 @@ package codetracer_beam_recorder:
     var beamEdges: seq[BuildActionDef] =
       @[elixirCanonicalFlow, erlangCanonicalFlow, cliSmoke]
 
-    # The twelve live-BEAM Elixir integration suites. Each drives the
+    # The thirteen live-BEAM Elixir integration suites. Each drives the
     # recorder against a real BEAM VM and asserts on the produced CTFS
-    # trace. ``function_trace_test`` is intentionally omitted (see the
-    # docstring — pre-existing recorder/test drift, not weakened).
+    # trace. ``function_trace_test`` is enrolled here (re-included in FUP-L
+    # after its stale "completion order" call-ordering assertions were
+    # corrected to the spec-correct call-entry order the recorder emits;
+    # the recorder was not touched — see the docstring).
     const beamIntegrationTests = [
       "ctfs_writer_bridge_test",
       "runtime_session_test",
+      "function_trace_test",
       "message_trace_test",
       "manifest_source_location_test",
       "step_instrumentation_test",

@@ -104,13 +104,18 @@ defmodule CodetracerBeamRecorder.FunctionTraceTest do
            "canonical_flow must not emit exception_from; got #{summary["sidecar_exception_from_count"]}"
 
     # The CTFS reader must surface both calls with the same function_ids the
-    # interner handed out. Order in `call_function_ids` is completion order:
-    # compute completes before main returns, so compute's record comes first.
+    # interner handed out. Order in `call_function_ids` is call-entry order per
+    # the trace-format `call_key` contract: a call record is created and its
+    # `call_key` assigned at CALL ENTRY (see `codetracer_trace_writer/
+    # call_stream.rs` `CallStreamBuilder.observe`, which pushes the record with
+    # `call_key = records.len()` on the `Call` event; the matching `Return` only
+    # finalizes the record's contents in place). So main (entered first) comes
+    # before compute (entered second): [main, compute].
     assert summary["call_count"] == 2,
            "expected exactly 2 paired call records in the CTFS bundle; got #{summary["call_count"]}"
 
-    assert summary["call_function_ids"] == [compute_id, main_id],
-           "expected call records [compute, main] (completion order); got #{inspect(summary["call_function_ids"])} with names #{inspect(summary["function_names"])}"
+    assert summary["call_function_ids"] == [main_id, compute_id],
+           "expected call records [main, compute] (call-entry order); got #{inspect(summary["call_function_ids"])} with names #{inspect(summary["function_names"])}"
   end
 
   test "e2e_runtime_records_real_exception_fixture" do
@@ -266,23 +271,27 @@ defmodule CodetracerBeamRecorder.FunctionTraceTest do
     compute_id =
       Enum.find_index(summary["function_names"], &(&1 == "canonical_flow:compute/0"))
 
-    assert summary["call_function_ids"] == [compute_id, main_id],
-           "expected call records [compute, main]; got #{inspect(summary["call_function_ids"])}"
+    # Call records are in call-entry order per the trace-format `call_key`
+    # contract (see `call_stream.rs` `CallStreamBuilder.observe`): main is
+    # entered first (call_key 0), compute second (call_key 1), so [main, compute].
+    assert summary["call_function_ids"] == [main_id, compute_id],
+           "expected call records [main, compute] (call-entry order per the trace-format call_key contract); got #{inspect(summary["call_function_ids"])}"
 
     # `call_json` is the raw output of `NimTraceReaderHandle::call_json` — it
-    # must round-trip through serde and contain the parent/child structure.
+    # must round-trip through serde and contain the parent/child structure. The
+    # records come out in call-entry (`call_key`) order: main first, compute second.
     assert length(summary["call_json"]) == 2
 
-    [compute_call_json, main_call_json] = summary["call_json"]
-
-    assert String.contains?(compute_call_json, "\"function_id\":#{compute_id}"),
-           "first call_json must reference compute's function_id; got #{compute_call_json}"
+    [main_call_json, compute_call_json] = summary["call_json"]
 
     assert String.contains?(main_call_json, "\"function_id\":#{main_id}"),
-           "second call_json must reference main's function_id; got #{main_call_json}"
+           "first call_json must reference main's function_id; got #{main_call_json}"
 
-    assert String.contains?(main_call_json, "\"children\":[0]"),
-           "main's call record must list compute as a child call key; got #{main_call_json}"
+    assert String.contains?(compute_call_json, "\"function_id\":#{compute_id}"),
+           "second call_json must reference compute's function_id; got #{compute_call_json}"
+
+    assert String.contains?(main_call_json, "\"children\":[1]"),
+           "main's call record must list compute's call key (1) as a child; got #{main_call_json}"
 
     # event_count and step_count are non-zero — meaning the reader is
     # actually decoding the bundle, not silently returning empties.
