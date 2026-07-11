@@ -33,7 +33,7 @@ on:
 
 jobs:
   wdio-integration:
-    runs-on: [self-hosted, nixos]
+    runs-on: incus
 
     steps:
       - name: Generate CI token
