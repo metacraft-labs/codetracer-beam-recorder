@@ -9,11 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use codetracer_ctfs::CtfsReader;
 use codetracer_trace_reader::call_stream_reader::CallStreamReader;
 use codetracer_trace_reader::value_stream_reader::ValueStreamReader;
+use codetracer_trace_types::{TraceLowLevelEvent, TypeKind, TypeRecord, ValueRecord};
 use codetracer_trace_writer::call_stream::VOID_RETURN_MARKER;
 use codetracer_trace_writer::value_stream::ValueStreamEvent;
-use codetracer_trace_types::{
-    TraceLowLevelEvent, TypeKind, TypeRecord, ValueRecord,
-};
 use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use serde_json::Value;
 
