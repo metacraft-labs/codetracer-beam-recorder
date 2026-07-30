@@ -76,13 +76,15 @@ offline, so we cannot pull the `:plug` Hex package as a dependency.
 - The handler call sequence (`Router.route -> dispatch -> render`)
   is asserted in `tests/integration/plug_smoke_test.exs`.
 
-**What's deferred:**
-
-- Pulling real `:plug` + `:cowboy` from Hex.pm and recording
-  Phoenix's `mix phx.new --no-html --no-ecto`.
-
-The fixture's API shape is a 1:1 match for `Plug.Router`, so swapping
-the in-tree implementation for the Hex packages is mechanical.
+**Resolved by RS-M8.** `test-programs/elixir/plug_web` (a real
+`Plug.Router` on a real Cowboy listener) and
+`test-programs/elixir/phoenix_web` (a real `Phoenix.Endpoint`, router
+and controllers) now take `plug_cowboy` and `phoenix` from Hex, fetched
+by `just prepare-web-fixtures`, and are recorded end to end by
+`tests/integration/plug_requests_test.exs` and
+`tests/integration/phoenix_requests_test.exs`. The offline `plug_smoke`
+fixture is kept alongside them, not replaced: it is the one
+request-shaped fixture that needs nothing from the network.
 
 ## M17: macOS CI matrix
 

@@ -387,7 +387,7 @@ package codetracer_beam_recorder:
     var beamEdges: seq[BuildActionDef] =
       @[elixirCanonicalFlow, erlangCanonicalFlow, cliSmoke]
 
-    # The thirteen live-BEAM Elixir integration suites. Each drives the
+    # The fifteen live-BEAM Elixir integration suites. Each drives the
     # recorder against a real BEAM VM and asserts on the produced CTFS
     # trace. ``function_trace_test`` is enrolled here (re-included in FUP-L
     # after its stale "completion order" call-ordering assertions were
@@ -406,6 +406,13 @@ package codetracer_beam_recorder:
       "native_tracer_bench_test",
       "otp_fixture_matrix_test",
       "plug_smoke_test",
+      # RS-M8 web-request spans. These two need the real plug_cowboy /
+      # phoenix packages under each demo's ``deps/``; the fetch is
+      # ``scripts/prepare-web-fixtures.sh`` (``just prepare-web-fixtures``)
+      # and the suites fail loudly rather than skipping when it has not
+      # been run, so an unfetched tree can never look like coverage.
+      "plug_requests_test",
+      "phoenix_requests_test",
       "stress_event_volume_test"
     ]
     # Per-test ExUnit timeout (ms) applied to the MONITORED integration
@@ -442,8 +449,17 @@ package codetracer_beam_recorder:
       # they do not race ExUnit's timeout under contention, AND given a
       # raised (5 min) per-test ExUnit timeout so the ~5x monitor-shim
       # overhead cannot prematurely kill a correct, slow-under-monitor test.
+      # RS-M8: the two web-span suites are recorded against real Hex
+      # packages, so their edge fetches them first. Every other suite runs
+      # entirely offline and must keep doing so.
+      let prepare =
+        if t in ["plug_requests_test", "phoenix_requests_test"]:
+          "bash scripts/prepare-web-fixtures.sh && "
+        else:
+          ""
       beamEdges.add pooledShell(
         command =
+          prepare &
           "CODETRACER_BEAM_RECORDER_BIN=\"$PWD/" & recorderDebugBinary &
           "\" " & exUnitTimeoutPrelude & "tests/integration/" & t & ".exs",
         pool = beamSerialPool,
@@ -451,11 +467,12 @@ package codetracer_beam_recorder:
         after = @[recorderDebugBuild],
         extraInputs = @[
           "tests/integration/" & t & ".exs",
+          "tests/integration/support", "scripts",
           "lib", "test-programs", "mix.exs", "rebar3_codetracer",
           recorderDebugBinary],
         cacheable = false)
 
-    # The fifteen ``verify-*-no-silent-skip.sh`` structural gates: pure
+    # The seventeen ``verify-*-no-silent-skip.sh`` structural gates: pure
     # ``sh`` + ``grep`` assertions that the integration test files and
     # their Justfile wiring have not been gutted into no-ops. Cheap and
     # deterministic, so left cacheable (the default).
@@ -473,6 +490,8 @@ package codetracer_beam_recorder:
       "native-tracer-bench-test",
       "otp-fixture-matrix-test",
       "plug-smoke-test",
+      "plug-requests-test",
+      "phoenix-requests-test",
       "stress-event-volume-test",
       "release-check"
     ]
@@ -483,6 +502,6 @@ package codetracer_beam_recorder:
         extraInputs = @[
           "tests/verify-" & g & "-no-silent-skip.sh",
           "tests/integration", "tests/fixtures", "scripts",
-          "Justfile"])
+          "test-programs", "repro.nim", "Justfile"])
 
     discard collect("test", @[testsRun.action, goldenVerify] & beamEdges)

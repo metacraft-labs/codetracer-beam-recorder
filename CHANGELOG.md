@@ -8,6 +8,35 @@ Versions are SemVer; the canonical version lives in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- RS-M8: web-request spans. `CodetracerBeamRecorder.Plug` records one
+  span per HTTP request directly into the recording's `.ct` container —
+  no sidecar file — with the owning BEAM process id in metadata.
+  Phoenix apps additionally get `http.route` resolved from the router,
+  so a row shows the pattern the request matched rather than the path
+  the client typed.
+- RS-M8: `codetracer-beam-recorder read-spans --bundle DIR [--all]`
+  prints a recorded bundle's span stream as JSON, decoded through the
+  canonical Nim span reader.
+- RS-M8: `test-programs/elixir/plug_web` and
+  `test-programs/elixir/phoenix_web` demo apps, driven end to end by
+  `tests/integration/plug_requests_test.exs` and
+  `tests/integration/phoenix_requests_test.exs`, plus
+  `just demo-request-panel-elixir` and
+  `just record-request-panel-fixture`.
+
+### Notes
+
+- A BEAM process is mapped onto a container **thread**, not a container
+  process: a recording is one OS process, so every web-request span
+  carries `process_ord = 0` and the thread id its pid was assigned.
+- The three structural bits are measured from the recording rather than
+  declared. Requests that overlap carry `concurrent_with_siblings` and
+  are not `contiguous_on_one_thread`, because the recorder replays its
+  session into a single exec stream in which their events interleave.
+
+
 ## [0.1.0] - 2026-05-08
 
 This is the M17 release-hardening cut. The recorder is feature-complete

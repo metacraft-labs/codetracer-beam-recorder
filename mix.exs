@@ -14,7 +14,20 @@ defmodule CodetracerBeamRecorder.MixProject do
       description: description(),
       package: package(),
       source_url: @repo_url,
-      homepage_url: @repo_url
+      homepage_url: @repo_url,
+      deps: deps()
+    ]
+  end
+
+  # `:plug` is optional: `CodetracerBeamRecorder.Plug` (RS-M8 web-request
+  # spans) is compiled against it, and every other part of the package —
+  # the mix tasks, the source map, the Erlang runtime app — works without a
+  # web framework anywhere in sight.  Marking it optional means a plain
+  # Elixir project that only wants `mix codetracer.record` does not pull in
+  # Plug, while a Plug or Phoenix project already has it.
+  defp deps do
+    [
+      {:plug, "~> 1.14", optional: true}
     ]
   end
 

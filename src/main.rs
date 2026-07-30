@@ -14,7 +14,8 @@ use codetracer_trace_types::{
     TypeKind, TypeRecord, TypeSpecificInfo, ValueRecord, VariableId,
 };
 use codetracer_trace_writer_nim::{
-    NimTraceReaderHandle, NimTraceWriter, TraceEventsFileFormat as NimFormat,
+    read_span_stream_json, NimTraceReaderHandle, NimTraceWriter, SpanRecord,
+    TraceEventsFileFormat as NimFormat, SPAN_STATUS_ERROR, SPAN_STATUS_OK, SPAN_STATUS_UNKNOWN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,8 @@ fn run() -> Result<i32, RecorderDiagnostic> {
             .map_err(|error| RecorderDiagnostic::writer_initialization_failed(error.to_string()))?,
         "read-bundle-summary" => read_bundle_summary_command(args)
             .map_err(|error| RecorderDiagnostic::writer_initialization_failed(error.to_string()))?,
+        "read-spans" => read_spans_command(args)
+            .map_err(|error| RecorderDiagnostic::writer_initialization_failed(error.to_string()))?,
         command => {
             return Err(RecorderDiagnostic::invalid_arguments(format!(
                 "unknown command: {command}"
@@ -72,6 +75,7 @@ Usage:
   {BINARY_NAME} record [OPTIONS] [--] COMMAND [ARGS...]
   {BINARY_NAME} instrument [OPTIONS] --source-dir PATH
   {BINARY_NAME} compile [OPTIONS] --source-dir PATH
+  {BINARY_NAME} read-spans --bundle DIR [--all]
   {BINARY_NAME} version
 
 The recorder writes trace bundles in CTFS format exclusively. Use
@@ -1246,12 +1250,21 @@ impl RecordingSession {
             .iter()
             .map(|location| (location.location_id, location))
             .collect::<HashMap<_, _>>();
+        // RS-M8 span bookkeeping.  `thread_switch_points` records the exec
+        // index each `thread_switch` event occupies, which is the only thing
+        // that moves the writer's notion of "current thread"; it is what makes
+        // `contiguous_on_one_thread` a measured fact below rather than a
+        // hopeful constant.
+        let mut open_web_spans: BTreeMap<u64, OpenWebRequestSpan> = BTreeMap::new();
+        let mut settled_web_spans: Vec<RecordedWebRequestSpan> = Vec::new();
+        let mut thread_switch_points: Vec<(u64, u64)> = Vec::new();
         for event in &runtime_result.trace_events {
             match event {
                 RuntimeTraceEvent::ThreadStart { thread_id, .. } => {
                     self.writer.register_thread_start(*thread_id);
                 }
                 RuntimeTraceEvent::ThreadSwitch { thread_id, .. } => {
+                    thread_switch_points.push((self.writer.next_step_index(), *thread_id));
                     self.writer.register_thread_switch(*thread_id);
                 }
                 RuntimeTraceEvent::ThreadExit { thread_id, .. } => {
@@ -1421,7 +1434,189 @@ impl RecordingSession {
                         &content,
                     );
                 }
+                RuntimeTraceEvent::WebRequestStart {
+                    span_id,
+                    thread_id,
+                    pid,
+                    wall_ns,
+                    metadata,
+                } => {
+                    // The runtime wrote a `thread_switch` for this process
+                    // immediately before this marker, so the writer's current
+                    // thread is already the request's and the next exec index
+                    // is the first event that belongs to the request.
+                    open_web_spans.insert(
+                        *span_id,
+                        OpenWebRequestSpan {
+                            span_id: *span_id,
+                            thread_id: *thread_id,
+                            pid: pid.clone(),
+                            start_wall_ns: *wall_ns,
+                            start_step: self.writer.next_step_index(),
+                            metadata: metadata.clone(),
+                        },
+                    );
+                }
+                RuntimeTraceEvent::WebRequestStop {
+                    span_id,
+                    wall_ns,
+                    metadata,
+                    ..
+                } => {
+                    let Some(open) = open_web_spans.remove(span_id) else {
+                        return Err(RecorderDiagnostic::writer_finalization_failed(format!(
+                            "runtime emitted web_request_stop for unknown span_id {span_id}"
+                        )));
+                    };
+                    // `next_step_index()` is the index the NEXT event will
+                    // take, so the last one already recorded is one less.  A
+                    // request that recorded nothing at all collapses to the
+                    // single index it started on rather than wrapping around.
+                    let end_step = self
+                        .writer
+                        .next_step_index()
+                        .saturating_sub(1)
+                        .max(open.start_step);
+                    settled_web_spans.push(RecordedWebRequestSpan {
+                        end_wall_ns: *wall_ns,
+                        end_step,
+                        stop_metadata: metadata.clone(),
+                        open,
+                    });
+                }
             }
+        }
+
+        self.register_web_request_spans(
+            open_web_spans.into_values().collect(),
+            settled_web_spans,
+            &thread_switch_points,
+        )?;
+
+        Ok(())
+    }
+
+    /// RS-M8 — publish the recording's web-request spans into `spans.dat`.
+    ///
+    /// Every span is published twice, exactly as a live middleware would: an
+    /// `is_open` record when the request started, and a settled record when it
+    /// finished.  Readers apply last-record-wins per `span_id`, so a request
+    /// whose process died before it could settle (its stop marker never
+    /// reached the sidecar) still shows up — as an in-flight row, which is the
+    /// truth about it — instead of vanishing from the panel.
+    ///
+    /// The three structural bits (`Trace-Spans.md` § 2.4) are *measured* here,
+    /// not assumed:
+    ///
+    /// * `shares_timeline` — always true.  One writer replays the whole
+    ///   sidecar into one exec stream, so every span's step range is
+    ///   comparable with every other's.
+    /// * `contiguous_on_one_thread` — true only when no `thread_switch` inside
+    ///   the span's step range moves the writer to a different thread.  A BEAM
+    ///   process handles its request start to finish, but the *container's*
+    ///   exec stream is shared, so a request that overlapped another one has
+    ///   the other one's events interleaved into its range and is not
+    ///   contiguous.  A request served while nothing else was in flight is.
+    /// * `concurrent_with_siblings` — true when this span's step range
+    ///   overlaps another web-request span's.  Cowboy and Bandit spawn a
+    ///   process per connection and they genuinely run at the same time, so
+    ///   this is normally true under load and false for an idle-server
+    ///   request.
+    fn register_web_request_spans(
+        &mut self,
+        still_open: Vec<OpenWebRequestSpan>,
+        settled: Vec<RecordedWebRequestSpan>,
+        thread_switch_points: &[(u64, u64)],
+    ) -> Result<(), RecorderDiagnostic> {
+        if still_open.is_empty() && settled.is_empty() {
+            return Ok(());
+        }
+
+        let ranges = settled
+            .iter()
+            .map(|span| (span.open.span_id, span.open.start_step, span.end_step))
+            .collect::<Vec<_>>();
+
+        let mut records: Vec<SpanRecord> = Vec::new();
+
+        // Open records first, in span-id (i.e. request-arrival) order, so the
+        // stream reads like the live sequence it stands in for.
+        let mut opens = still_open
+            .iter()
+            .map(|open| (open.span_id, open))
+            .chain(settled.iter().map(|span| (span.open.span_id, &span.open)))
+            .collect::<Vec<_>>();
+        opens.sort_by_key(|(span_id, _)| *span_id);
+        for (_, open) in opens {
+            records.push(SpanRecord {
+                span_id: open.span_id,
+                is_open: true,
+                status: SPAN_STATUS_UNKNOWN,
+                start_wall_ns: open.start_wall_ns,
+                end_wall_ns: 0,
+                process_ord: BEAM_PROCESS_ORD,
+                thread_id: open.thread_id,
+                start_step: open.start_step,
+                end_step: 0,
+                span_type: WEB_REQUEST_SPAN_TYPE.to_string(),
+                label: web_request_label(&open.metadata),
+                // In flight: how the interval ends, and whether anything else
+                // ran during it, are not yet facts.  Only the timeline claim
+                // is already true.
+                shares_timeline: true,
+                metadata: web_request_metadata(open, &[]),
+                ..SpanRecord::default()
+            });
+        }
+
+        for span in &settled {
+            let metadata = web_request_metadata(&span.open, &span.stop_metadata);
+            let status_code = metadata
+                .iter()
+                .find(|(key, _)| key == "http.status_code")
+                .and_then(|(_, value)| value.parse::<u32>().ok())
+                .unwrap_or(0);
+            let concurrent = ranges.iter().any(|(other_id, other_start, other_end)| {
+                *other_id != span.open.span_id
+                    && *other_start <= span.end_step
+                    && span.open.start_step <= *other_end
+            });
+            let contiguous = !thread_switch_points.iter().any(|(index, thread_id)| {
+                *index >= span.open.start_step
+                    && *index <= span.end_step
+                    && *thread_id != span.open.thread_id
+            });
+            records.push(SpanRecord {
+                span_id: span.open.span_id,
+                is_open: false,
+                status: if status_code >= 400 {
+                    SPAN_STATUS_ERROR
+                } else {
+                    SPAN_STATUS_OK
+                },
+                start_wall_ns: span.open.start_wall_ns,
+                end_wall_ns: span.end_wall_ns,
+                process_ord: BEAM_PROCESS_ORD,
+                thread_id: span.open.thread_id,
+                start_step: span.open.start_step,
+                end_step: span.end_step,
+                span_type: WEB_REQUEST_SPAN_TYPE.to_string(),
+                label: web_request_label(&metadata),
+                contiguous_on_one_thread: contiguous,
+                shares_timeline: true,
+                concurrent_with_siblings: concurrent,
+                metadata,
+                ..SpanRecord::default()
+            });
+        }
+
+        for record in &records {
+            self.writer.register_span(record).map_err(|error| {
+                RecorderDiagnostic::writer_finalization_failed(format!(
+                    "failed to register web-request span {}: {error}",
+                    record.span_id
+                ))
+            })?;
         }
 
         Ok(())
@@ -1733,6 +1928,12 @@ struct RuntimeSidecarEvent {
     clause_id: Option<u32>,
     source_location: Option<ResolvedSourceLocation>,
     source_language: Option<String>,
+    // RS-M8 web-request span markers.  `metadata` is an array of two-element
+    // arrays rather than an object because span metadata order is part of the
+    // contract all the way to the Request Panel.
+    span_id: Option<u64>,
+    wall_ns: Option<u64>,
+    metadata: Option<Vec<(String, String)>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1863,6 +2064,112 @@ enum RuntimeTraceEvent {
     Message {
         payload: BeamMessagePayload,
     },
+    /// RS-M8.  A request-handling process told the session that a web request
+    /// started.  The marker itself produces no exec-stream event; replaying it
+    /// samples the writer's step counter, which is what binds the span to the
+    /// container.
+    WebRequestStart {
+        span_id: u64,
+        thread_id: u64,
+        pid: String,
+        wall_ns: u64,
+        metadata: Vec<(String, String)>,
+    },
+    /// The stop marker carries no coordinate of its own: a span is bound to
+    /// the process that OPENED it, so the pid and thread id on this sidecar
+    /// line are only there for a human reading the raw session file.
+    WebRequestStop {
+        span_id: u64,
+        wall_ns: u64,
+        metadata: Vec<(String, String)>,
+    },
+}
+
+/// RS-M8.  `span_type` for an HTTP request interval, per
+/// `codetracer-specs/Planned-Features/Trace-Spans.md` § 2.1.
+const WEB_REQUEST_SPAN_TYPE: &str = "web-request";
+
+/// RS-M8.  Ordinal into the container's process table.
+///
+/// **BEAM processes are not container processes.** A span's coordinate is
+/// `(process_ord, thread_id, step range)`; the BEAM recorder records one OS
+/// process (the `beam.smp` the recorder launched) and maps each *BEAM* process
+/// onto a container **thread** — `codetracer_session:ensure_pid_thread/3`
+/// mints a thread id per pid and the replay turns those into
+/// `register_thread_start` / `register_thread_switch`.  So every web-request
+/// span in a BEAM recording names the primary process and distinguishes
+/// requests by `thread_id`.  The BEAM pid itself is carried as `beam.pid`
+/// metadata, since a container thread id is not something an Elixir developer
+/// can look up in `observer`.
+const BEAM_PROCESS_ORD: u64 = 0;
+
+/// RS-M8.  A `web_request_start` marker that has been replayed but whose
+/// matching stop has not been seen yet.
+#[derive(Clone, Debug)]
+struct OpenWebRequestSpan {
+    span_id: u64,
+    thread_id: u64,
+    pid: String,
+    start_wall_ns: u64,
+    start_step: u64,
+    metadata: Vec<(String, String)>,
+}
+
+/// RS-M8.  A web-request span whose stop marker has been replayed.
+#[derive(Clone, Debug)]
+struct RecordedWebRequestSpan {
+    open: OpenWebRequestSpan,
+    end_wall_ns: u64,
+    end_step: u64,
+    stop_metadata: Vec<(String, String)>,
+}
+
+/// RS-M8.  The panel's row label: `"GET /api/users"`.
+fn web_request_label(metadata: &[(String, String)]) -> String {
+    let lookup = |key: &str| {
+        metadata
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+            .unwrap_or_default()
+    };
+    let method = lookup("http.method");
+    let url = lookup("http.url");
+    if method.is_empty() {
+        url.to_string()
+    } else {
+        format!("{method} {url}")
+    }
+}
+
+/// RS-M8.  Merge the start and stop metadata a middleware supplied and append
+/// the process coordinate the *session* observed.
+///
+/// `beam.pid` and `beam.thread_id` come from the sidecar rather than from the
+/// middleware on purpose: they are what
+/// `codetracer_session:ensure_event_thread/3` actually bound the span to, so a
+/// middleware cannot misreport them.
+fn web_request_metadata(
+    open: &OpenWebRequestSpan,
+    stop_metadata: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut metadata = open.metadata.clone();
+    for (key, value) in stop_metadata {
+        match metadata.iter_mut().find(|(existing, _)| existing == key) {
+            Some(slot) => slot.1 = value.clone(),
+            None => metadata.push((key.clone(), value.clone())),
+        }
+    }
+    for (key, value) in [
+        ("beam.pid".to_string(), open.pid.clone()),
+        ("beam.thread_id".to_string(), open.thread_id.to_string()),
+    ] {
+        match metadata.iter_mut().find(|(existing, _)| *existing == key) {
+            Some(slot) => slot.1 = value,
+            None => metadata.push((key, value)),
+        }
+    }
+    metadata
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2439,6 +2746,34 @@ impl RuntimeSession {
                             )?,
                             message_truncated: event.message_truncated.unwrap_or(false),
                         },
+                    });
+                }
+                "web_request_start" | "web_request_stop" => {
+                    let span_id = event.span_id.ok_or_else(|| {
+                        RecorderDiagnostic::writer_finalization_failed(format!(
+                            "runtime sidecar line {} missing required field span_id",
+                            line_number + 1
+                        ))
+                    })?;
+                    let thread_id = event.thread_id.unwrap_or(root_thread_id);
+                    let pid = event.pid.clone().unwrap_or_default();
+                    let wall_ns = event.wall_ns.unwrap_or(0);
+                    let metadata = event.metadata.clone().unwrap_or_default();
+                    trace_events.push(if event.event == "web_request_start" {
+                        RuntimeTraceEvent::WebRequestStart {
+                            span_id,
+                            thread_id,
+                            pid,
+                            wall_ns,
+                            metadata,
+                        }
+                    } else {
+                        let _ = (&pid, thread_id);
+                        RuntimeTraceEvent::WebRequestStop {
+                            span_id,
+                            wall_ns,
+                            metadata,
+                        }
                     });
                 }
                 _ => {}
@@ -5188,6 +5523,64 @@ struct MessageEventLogSummary {
     recipient_thread_id: Option<u64>,
     payload_repr: String,
     payload_truncated: bool,
+}
+
+/// RS-M8 — print the recorded bundle's span stream as JSON.
+///
+/// Decoding goes through `read_span_stream_json`, i.e. the canonical Nim
+/// decoder (`initSpanStreamReader` behind `ct_spans_json`) that `ct print -f
+/// http` and the Request Panel's backend both use.  The integration tests
+/// assert on *that* output rather than on a second decoder written for the
+/// tests, so a span the recorder wrote and the shipped reader cannot read
+/// fails the suite.
+///
+/// `--settled` (the default) applies last-record-wins per span id — what a
+/// panel displays.  `--all` returns every appended record, open ones included,
+/// which is how a test checks that each request was published in flight before
+/// it was settled.
+fn read_spans_command(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let mut bundle_dir: Option<PathBuf> = None;
+    let mut ct_file_name: Option<String> = None;
+    let mut settled = true;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-b" | "--bundle" => {
+                let Some(value) = iter.next() else {
+                    return Err(format!("{arg} requires a directory").into());
+                };
+                bundle_dir = Some(PathBuf::from(value));
+            }
+            "--ct-file" => {
+                let Some(value) = iter.next() else {
+                    return Err(format!("{arg} requires a file name").into());
+                };
+                ct_file_name = Some(value);
+            }
+            "--settled" => settled = true,
+            "--all" => settled = false,
+            other if other.starts_with("--bundle=") => {
+                bundle_dir = Some(PathBuf::from(other.trim_start_matches("--bundle=")));
+            }
+            other if other.starts_with("--ct-file=") => {
+                ct_file_name = Some(other.trim_start_matches("--ct-file=").to_string());
+            }
+            other => return Err(format!("unexpected read-spans argument: {other}").into()),
+        }
+    }
+    let bundle_dir = bundle_dir.ok_or_else(|| "read-spans requires --bundle DIR".to_string())?;
+    let bundle_dir = bundle_dir.canonicalize().map_err(|error| {
+        format!(
+            "bundle directory not found: {}: {error}",
+            bundle_dir.display()
+        )
+    })?;
+    let ct_path = match &ct_file_name {
+        Some(name) => bundle_dir.join(name),
+        None => find_single_ct_file(&bundle_dir)?,
+    };
+    println!("{}", read_span_stream_json(&ct_path, settled)?);
+    Ok(())
 }
 
 fn read_bundle_summary_command(args: Vec<String>) -> Result<(), Box<dyn Error>> {

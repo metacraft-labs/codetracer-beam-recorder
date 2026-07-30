@@ -15,6 +15,9 @@ extension, the DAP bridge) can consume a recorder-produced bundle.
   command-line interface.
 - [`source-maps.md`](source-maps.md) — sparse source-map artifacts and
   how the recorder copies sources into the bundle.
+- [`web-request-spans.md`](web-request-spans.md) — recording one span per
+  HTTP request from Plug or Phoenix, and how a BEAM process maps onto a
+  span's coordinate.
 - [`module-filters.md`](module-filters.md) — `--include-module`,
   `--exclude-module`, and the runtime trace-pattern dispatch.
 - [`ctfs-output.md`](ctfs-output.md) — what's inside a CTFS bundle and

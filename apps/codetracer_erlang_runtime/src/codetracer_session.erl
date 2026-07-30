@@ -5,6 +5,7 @@
 
 -export([start/2, stop/1]).
 -export([start_session/1, step/1, bind_many/1, stop_session/1]).
+-export([web_request_start/1, web_request_stop/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -record(state, {
@@ -28,7 +29,27 @@
     %% M16: tracer backend selection. process is the default; native dispatches
     %% to codetracer_native_tracer which owns its own writer process and queue.
     tracer_backend = process,
-    native_tracer_pid = undefined
+    native_tracer_pid = undefined,
+    %% RS-M8: web-request spans.
+    %%
+    %% next_span_id  -- 1-based, monotonic within the recording; it is the
+    %%                  span stream's last-record-wins key.
+    %% open_spans    -- SpanId => PidText for spans that have been opened and
+    %%                  not yet settled. It is keyed by span id rather than by
+    %%                  pid on purpose: a keep-alive connection process serves
+    %%                  many requests in sequence, and a proxy-style handler
+    %%                  can serve one request inside another, so "the open span
+    %%                  of this process" is not a well-defined thing to look up.
+    %% web_traced_pids -- PidText => true for request processes this session
+    %%                  turned `call' tracing on for. Cowboy and Bandit spawn
+    %%                  their connection processes from the ranch/thousand
+    %%                  island supervision tree, NOT from the recorded root
+    %%                  process, so `set_on_spawn' never reaches them: without
+    %%                  this the request would produce no steps at all and the
+    %%                  span would bind to an empty range.
+    next_span_id = 1,
+    open_spans = #{},
+    web_traced_pids = #{}
 }).
 
 start(_Type, _Args) ->
@@ -63,6 +84,38 @@ bind_many(Bindings) when is_list(Bindings) ->
             ok;
         _Pid ->
             gen_server:call(?MODULE, {bind_many, self(), Bindings}, infinity)
+    end.
+
+%% RS-M8. Called from the request-handling process itself; the returned span id
+%% is held in the caller's own stack frame (the Plug's `call/2' frame and the
+%% `before_send' closure it registers), never in a process dictionary or a
+%% session-wide "current request" slot. That is what makes a request handled
+%% inside another request, or two requests on the same keep-alive connection
+%% process, come out as two independent spans.
+web_request_start(Metadata) when is_list(Metadata) ->
+    case whereis(?MODULE) of
+        undefined ->
+            {ok, 0};
+        _Pid ->
+            gen_server:call(
+                ?MODULE,
+                {web_request_start, self(), Metadata, erlang:system_time(nanosecond)},
+                infinity
+            )
+    end.
+
+web_request_stop(0, _Metadata) ->
+    ok;
+web_request_stop(SpanId, Metadata) when is_integer(SpanId), is_list(Metadata) ->
+    case whereis(?MODULE) of
+        undefined ->
+            ok;
+        _Pid ->
+            gen_server:call(
+                ?MODULE,
+                {web_request_stop, self(), SpanId, Metadata, erlang:system_time(nanosecond)},
+                infinity
+            )
     end.
 
 init([]) ->
@@ -160,6 +213,90 @@ handle_call({bind_many, Pid, Bindings}, _From, State = #state{started = true, fi
     State2 = bind_variables(File, Pid, ThreadId, Bindings, State1),
     {reply, ok, State2};
 handle_call({bind_many, _Pid, _Bindings}, _From, State) ->
+    {reply, ok, State};
+%% RS-M8 --- web-request spans.
+%%
+%% The native backend does not own the sidecar file (codetracer_native_tracer
+%% does), so spans are not available there yet. Returning `{ok, 0}' makes the
+%% middleware a no-op rather than a crash, matching how `step' and `bind_many'
+%% already behave on that backend.
+handle_call({web_request_start, _Pid, _Metadata, _WallNs}, _From,
+            State = #state{started = true, tracer_backend = native}) ->
+    {reply, {ok, 0}, State};
+handle_call({web_request_start, Pid, Metadata, WallNs}, _From,
+            State0 = #state{started = true, file = File}) ->
+    %% Order matters here, and it is the opposite of what it looks like it
+    %% should be.
+    %%
+    %% The recorder samples the writer's exec counter when it replays the
+    %% marker, so `start_step' is the index of whatever event comes NEXT. By
+    %% writing the marker first and an unconditional `thread_switch' straight
+    %% after it, `start_step' is the index of a switch onto the REQUEST's own
+    %% thread. That matters because Elixir sources carry no per-line step
+    %% instrumentation under `mix run': without this, a request that produced
+    %% only call events would open on an index owned by whichever thread
+    %% happened to run next, and a solo request would collapse to an empty
+    %% range.
+    %%
+    %% The switch is unconditional rather than via `ensure_event_thread/3'
+    %% for the same reason: if the request's thread happened to be current
+    %% already, the conditional version writes nothing and the span opens on a
+    %% foreign event.
+    {ThreadId, State1} = ensure_pid_thread(File, Pid, State0),
+    State2 = enable_web_request_tracing(Pid, State1),
+    SpanId = State2#state.next_span_id,
+    Line = [
+        "{\"event\":\"web_request_start\",",
+        "\"span_id\":", integer_to_list(SpanId), ",",
+        "\"pid\":", json_string(pid_to_list(Pid)), ",",
+        "\"thread_id\":", integer_to_list(ThreadId), ",",
+        "\"wall_ns\":", integer_to_list(WallNs), ",",
+        "\"metadata\":[", join_json(metadata_pairs_json(Metadata)), "]",
+        "}\n"
+    ],
+    ok = file:write(File, Line),
+    State3 = force_thread_switch(File, Pid, ThreadId, State2),
+    {reply, {ok, SpanId}, State3#state{
+        next_span_id = SpanId + 1,
+        open_spans = maps:put(SpanId, pid_to_list(Pid), State3#state.open_spans)
+    }};
+handle_call({web_request_start, _Pid, _Metadata, _WallNs}, _From, State) ->
+    {reply, {ok, 0}, State};
+handle_call({web_request_stop, _Pid, _SpanId, _Metadata, _WallNs}, _From,
+            State = #state{started = true, tracer_backend = native}) ->
+    {reply, ok, State};
+handle_call({web_request_stop, Pid, SpanId, Metadata, WallNs}, _From,
+            State0 = #state{started = true, file = File}) ->
+    case maps:is_key(SpanId, State0#state.open_spans) of
+        false ->
+            %% Already settled (a `before_send' callback and the plug's own
+            %% `after' clause both fired), or never opened. Settling twice
+            %% would publish a second, later record that last-record-wins
+            %% would prefer -- so the first settlement is the one that counts.
+            {reply, ok, State0};
+        true ->
+            %% Mirror of the start marker: the switch goes FIRST, so the
+            %% recorder's `end_step = next_step_index() - 1' lands on an event
+            %% that belongs to this request's thread rather than on whatever
+            %% ran last.
+            {ThreadId, State1a} = ensure_pid_thread(File, Pid, State0),
+            State1 = force_thread_switch(File, Pid, ThreadId, State1a),
+            Line = [
+                "{\"event\":\"web_request_stop\",",
+                "\"span_id\":", integer_to_list(SpanId), ",",
+                "\"pid\":", json_string(pid_to_list(Pid)), ",",
+                "\"thread_id\":", integer_to_list(ThreadId), ",",
+                "\"wall_ns\":", integer_to_list(WallNs), ",",
+                "\"metadata\":[", join_json(metadata_pairs_json(Metadata)), "]",
+                "}\n"
+            ],
+            ok = file:write(File, Line),
+            State2 = disable_web_request_tracing(Pid, State1),
+            {reply, ok, State2#state{
+                open_spans = maps:remove(SpanId, State2#state.open_spans)
+            }}
+    end;
+handle_call({web_request_stop, _Pid, _SpanId, _Metadata, _WallNs}, _From, State) ->
     {reply, ok, State}.
 
 handle_cast(_Message, State) ->
@@ -415,6 +552,69 @@ trace_disable_flags(true) ->
     [call, procs, send, 'receive', set_on_spawn];
 trace_disable_flags(false) ->
     [call, procs, set_on_spawn].
+
+%% RS-M8. Flags used for a request-handling process, deliberately NARROWER
+%% than trace_flags/1:
+%%
+%%   * `call' is the point of the exercise -- the trace patterns installed at
+%%     start_session only fire for processes that carry this flag, and a
+%%     Cowboy/Bandit connection process does not inherit it from the root.
+%%   * `procs' + `set_on_spawn' so a handler that spawns a worker keeps that
+%%     work inside the recording, and so the process' exit is observed.
+%%   * `send'/`receive' are NOT enabled even when capture_messages is on. A
+%%     connection process exchanges a message with the socket owner, the
+%%     ranch transport and the logger for essentially every byte it moves, and
+%%     that traffic is not what a request span is about; including it would
+%%     multiply the recording's size without adding anything the panel shows.
+web_request_trace_flags() ->
+    [call, procs, set_on_spawn, {tracer, self()}].
+
+web_request_trace_disable_flags() ->
+    [call, procs, set_on_spawn].
+
+%% Write a `thread_switch' whether or not the thread is already current, and
+%% keep `last_thread_id' in step so the ordinary `ensure_event_thread/3' path
+%% stays correct afterwards. Only the span markers need this; every other
+%% event is happy with the conditional version.
+force_thread_switch(File, Pid, ThreadId, State) ->
+    ok = write_thread_event(
+        File,
+        "thread_switch",
+        ThreadId,
+        pid_to_list(Pid),
+        State#state.source_paths
+    ),
+    State#state{last_thread_id = ThreadId}.
+
+enable_web_request_tracing(Pid, State = #state{web_traced_pids = Traced}) ->
+    PidText = pid_to_list(Pid),
+    case maps:is_key(PidText, Traced) of
+        true ->
+            State;
+        false ->
+            _ = catch erlang:trace(Pid, true, web_request_trace_flags()),
+            State#state{web_traced_pids = maps:put(PidText, true, Traced)}
+    end.
+
+disable_web_request_tracing(Pid, State = #state{web_traced_pids = Traced}) ->
+    PidText = pid_to_list(Pid),
+    case maps:is_key(PidText, Traced) of
+        false ->
+            State;
+        true ->
+            _ = catch erlang:trace(Pid, false, web_request_trace_disable_flags()),
+            State#state{web_traced_pids = maps:remove(PidText, Traced)}
+    end.
+
+%% Metadata arrives as a proplist of `{Key, Value}' iodata pairs and is written
+%% as a JSON array of two-element arrays, NOT as an object: the span record's
+%% metadata is order-preserving all the way to the panel, and a JSON object
+%% would invite a decoder to sort it.
+metadata_pairs_json(Metadata) ->
+    [
+        [$[, json_string(Key), $,, json_string(Value), $]]
+     || {Key, Value} <- Metadata
+    ].
 
 clear_trace_patterns(TraceFunctions) ->
     lists:foreach(

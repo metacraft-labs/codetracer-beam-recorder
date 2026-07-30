@@ -14,3 +14,7 @@ test-programs/erlang/**/ct-traces/
 test-programs/erlang/**/ct-traces-*/
 test-programs/elixir/**/_build/
 test-programs/elixir/**/erl_crash.dump
+# RS-M8 web demos take real Hex dependencies (plug_cowboy, phoenix); the
+# resolved tree is fetched by scripts/prepare-web-fixtures.sh and pinned by
+# each demo's checked-in mix.lock, so the unpacked packages stay out of git.
+test-programs/elixir/**/deps/

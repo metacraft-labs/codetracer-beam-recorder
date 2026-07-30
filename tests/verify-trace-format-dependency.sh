@@ -4,7 +4,12 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workspace_root="$(cd "$repo_root/.." && pwd)"
 trace_format_dir="$workspace_root/codetracer-trace-format"
-expected_sha="9f971be4e85fa025676b91ff6293daad8d758285"
+# RS-M8 moves the pin forward to the commit that exposes the span API to Rust
+# consumers ("feat(spans): expose the span API and span-stream reader to Rust
+# consumers"). `NimTraceWriter::register_span`, `next_step_index` and
+# `read_span_stream_json` do not exist before it, so the BEAM recorder cannot
+# build against the previous pin at all.
+expected_sha="f4741ac3cbd232759a617d8d0b74fa39006ee7ec"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
