@@ -29,7 +29,7 @@ on:
 jobs:
   publish:
     # EXEMPTION (CIP-5): registry-publish — needs GitHub-hosted Hex/mix publish tooling
-    runs-on: ubuntu-latest
+    runs-on: eph-linux-x64
     environment: hex
     steps:
       - uses: actions/checkout@v4
