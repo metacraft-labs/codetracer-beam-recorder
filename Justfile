@@ -8,7 +8,7 @@ build-native:
   cd rebar3_codetracer && rebar3 compile
 
 test:
-  if ! command -v cargo >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v elixir >/dev/null 2>&1 || ! command -v mix >/dev/null 2>&1 || ! command -v erl >/dev/null 2>&1 || ! command -v erlc >/dev/null 2>&1 || ! command -v rebar3 >/dev/null 2>&1; then nix develop --command just test; else just test-rust && just test-goldens && just test-elixir && just test-erlang && just verify-trace-format-dependency && just test-integration && just verify-elixir-fixture-generation-no-silent-skip && just verify-beam-fixture-generation-no-silent-skip && just verify-runtime-session-test-no-silent-skip && just verify-function-trace-test-no-silent-skip && just verify-message-trace-test-no-silent-skip && just verify-manifest-source-location-test-no-silent-skip && just verify-step-instrumentation-test-no-silent-skip && just verify-native-tracer-parity-test-no-silent-skip && just verify-native-tracer-ordering-test-no-silent-skip && just verify-native-tracer-overflow-test-no-silent-skip && just verify-native-tracer-bench-test-no-silent-skip && just verify-otp-fixture-matrix-test-no-silent-skip && just verify-plug-smoke-test-no-silent-skip && just verify-plug-requests-test-no-silent-skip && just verify-phoenix-requests-test-no-silent-skip && just verify-stress-event-volume-test-no-silent-skip && just verify-release-check-no-silent-skip; fi
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v elixir >/dev/null 2>&1 || ! command -v mix >/dev/null 2>&1 || ! command -v erl >/dev/null 2>&1 || ! command -v erlc >/dev/null 2>&1 || ! command -v rebar3 >/dev/null 2>&1; then nix develop --command just test; else just test-rust && just test-goldens && just test-elixir && just test-erlang && just verify-trace-format-dependency && just test-integration && just verify-elixir-fixture-generation-no-silent-skip && just verify-beam-fixture-generation-no-silent-skip && just verify-runtime-session-test-no-silent-skip && just verify-function-trace-test-no-silent-skip && just verify-message-trace-test-no-silent-skip && just verify-manifest-source-location-test-no-silent-skip && just verify-step-instrumentation-test-no-silent-skip && just verify-native-tracer-parity-test-no-silent-skip && just verify-native-tracer-ordering-test-no-silent-skip && just verify-native-tracer-overflow-test-no-silent-skip && just verify-native-tracer-bench-test-no-silent-skip && just verify-otp-fixture-matrix-test-no-silent-skip && just verify-plug-smoke-test-no-silent-skip && just verify-plug-requests-test-no-silent-skip && just verify-phoenix-requests-test-no-silent-skip && just verify-nested-requests-test-no-silent-skip && just verify-stress-event-volume-test-no-silent-skip && just verify-release-check-no-silent-skip; fi
 
 t: test
 
@@ -44,6 +44,7 @@ test-integration:
   just prepare-web-fixtures
   elixir tests/integration/plug_requests_test.exs
   elixir tests/integration/phoenix_requests_test.exs
+  elixir tests/integration/nested_requests_test.exs
   elixir tests/integration/stress_event_volume_test.exs
 
 verify-trace-format-dependency:
@@ -93,6 +94,10 @@ verify-plug-requests-test-no-silent-skip:
 
 verify-phoenix-requests-test-no-silent-skip:
   bash tests/verify-phoenix-requests-test-no-silent-skip.sh
+
+# RS-M8 follow-up: the nested-request suite must stay a real nesting test.
+verify-nested-requests-test-no-silent-skip:
+  bash tests/verify-nested-requests-test-no-silent-skip.sh
 
 # RS-M8: fetch the real Plug/Cowboy and Phoenix packages the web demos are
 # recorded against.  Separate from the suites so a Hex outage is reported as
@@ -178,7 +183,7 @@ lint-rust:
   cargo clippy --locked --all-targets -- -D warnings
 
 lint-shell:
-  shellcheck tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/verify-beam-fixture-generation-no-silent-skip.sh tests/verify-runtime-session-test-no-silent-skip.sh tests/verify-function-trace-test-no-silent-skip.sh tests/verify-message-trace-test-no-silent-skip.sh tests/verify-manifest-source-location-test-no-silent-skip.sh tests/verify-step-instrumentation-test-no-silent-skip.sh tests/verify-native-tracer-parity-test-no-silent-skip.sh tests/verify-native-tracer-ordering-test-no-silent-skip.sh tests/verify-native-tracer-overflow-test-no-silent-skip.sh tests/verify-native-tracer-bench-test-no-silent-skip.sh tests/verify-otp-fixture-matrix-test-no-silent-skip.sh tests/verify-plug-smoke-test-no-silent-skip.sh tests/verify-plug-requests-test-no-silent-skip.sh tests/verify-phoenix-requests-test-no-silent-skip.sh tests/verify-stress-event-volume-test-no-silent-skip.sh tests/verify-release-check-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
+  shellcheck tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/verify-beam-fixture-generation-no-silent-skip.sh tests/verify-runtime-session-test-no-silent-skip.sh tests/verify-function-trace-test-no-silent-skip.sh tests/verify-message-trace-test-no-silent-skip.sh tests/verify-manifest-source-location-test-no-silent-skip.sh tests/verify-step-instrumentation-test-no-silent-skip.sh tests/verify-native-tracer-parity-test-no-silent-skip.sh tests/verify-native-tracer-ordering-test-no-silent-skip.sh tests/verify-native-tracer-overflow-test-no-silent-skip.sh tests/verify-native-tracer-bench-test-no-silent-skip.sh tests/verify-otp-fixture-matrix-test-no-silent-skip.sh tests/verify-plug-smoke-test-no-silent-skip.sh tests/verify-plug-requests-test-no-silent-skip.sh tests/verify-phoenix-requests-test-no-silent-skip.sh tests/verify-nested-requests-test-no-silent-skip.sh tests/verify-stress-event-volume-test-no-silent-skip.sh tests/verify-release-check-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
 
 verify-repo-requirements:
   bash tests/verify-repo-requirements.sh
@@ -195,7 +200,7 @@ format-rust:
   cargo fmt
 
 format-shell:
-  shfmt -w tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/verify-beam-fixture-generation-no-silent-skip.sh tests/verify-runtime-session-test-no-silent-skip.sh tests/verify-function-trace-test-no-silent-skip.sh tests/verify-message-trace-test-no-silent-skip.sh tests/verify-manifest-source-location-test-no-silent-skip.sh tests/verify-step-instrumentation-test-no-silent-skip.sh tests/verify-native-tracer-parity-test-no-silent-skip.sh tests/verify-native-tracer-ordering-test-no-silent-skip.sh tests/verify-native-tracer-overflow-test-no-silent-skip.sh tests/verify-native-tracer-bench-test-no-silent-skip.sh tests/verify-otp-fixture-matrix-test-no-silent-skip.sh tests/verify-plug-smoke-test-no-silent-skip.sh tests/verify-plug-requests-test-no-silent-skip.sh tests/verify-phoenix-requests-test-no-silent-skip.sh tests/verify-stress-event-volume-test-no-silent-skip.sh tests/verify-release-check-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
+  shfmt -w tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/verify-beam-fixture-generation-no-silent-skip.sh tests/verify-runtime-session-test-no-silent-skip.sh tests/verify-function-trace-test-no-silent-skip.sh tests/verify-message-trace-test-no-silent-skip.sh tests/verify-manifest-source-location-test-no-silent-skip.sh tests/verify-step-instrumentation-test-no-silent-skip.sh tests/verify-native-tracer-parity-test-no-silent-skip.sh tests/verify-native-tracer-ordering-test-no-silent-skip.sh tests/verify-native-tracer-overflow-test-no-silent-skip.sh tests/verify-native-tracer-bench-test-no-silent-skip.sh tests/verify-otp-fixture-matrix-test-no-silent-skip.sh tests/verify-plug-smoke-test-no-silent-skip.sh tests/verify-plug-requests-test-no-silent-skip.sh tests/verify-phoenix-requests-test-no-silent-skip.sh tests/verify-nested-requests-test-no-silent-skip.sh tests/verify-stress-event-volume-test-no-silent-skip.sh tests/verify-release-check-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
 
 test-integration-fixture:
   just test-integration

@@ -40,6 +40,25 @@ defmodule PlugWeb do
 
     port = :ranch.get_port(__MODULE__.HTTP)
 
+    if nested?() do
+      drive_nested(port)
+    else
+      drive_default(port, cohort)
+    end
+
+    :ok = Plug.Cowboy.shutdown(__MODULE__.HTTP)
+  end
+
+  # A single request whose handler serves another request inside itself, on
+  # the same BEAM process.  Kept out of the default schedule so the counts the
+  # other suites transcribe do not move.
+  defp drive_nested(port) do
+    {"GET", path, status} = get(port, "/proxy/healthz")
+    IO.puts("plug-web-request GET #{path} #{status}")
+    IO.puts("plug-web-nested-ok requests=1 port=#{port}")
+  end
+
+  defp drive_default(port, cohort) do
     cohort_results = drive_cohort(port, cohort)
     sequential_results = drive_sequential(port)
 
@@ -51,9 +70,9 @@ defmodule PlugWeb do
       "plug-web-ok requests=#{length(cohort_results) + length(sequential_results)} " <>
         "cohort=#{cohort} port=#{port}"
     )
-
-    :ok = Plug.Cowboy.shutdown(__MODULE__.HTTP)
   end
+
+  defp nested?, do: System.get_env("CT_PLUG_WEB_NESTED") == "1"
 
   # The cohort: `cohort` requests issued at once.  Each blocks in the handler
   # until all of them have arrived, so they are provably simultaneous.

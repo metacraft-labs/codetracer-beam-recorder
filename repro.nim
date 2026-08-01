@@ -413,6 +413,10 @@ package codetracer_beam_recorder:
       # been run, so an unfetched tree can never look like coverage.
       "plug_requests_test",
       "phoenix_requests_test",
+      # Same plug_web demo, driven in its nested schedule: one request
+      # served inside another on ONE process, so the session's per-pid
+      # trace bookkeeping is exercised. Needs the same ``deps/`` fetch.
+      "nested_requests_test",
       "stress_event_volume_test"
     ]
     # Per-test ExUnit timeout (ms) applied to the MONITORED integration
@@ -449,11 +453,13 @@ package codetracer_beam_recorder:
       # they do not race ExUnit's timeout under contention, AND given a
       # raised (5 min) per-test ExUnit timeout so the ~5x monitor-shim
       # overhead cannot prematurely kill a correct, slow-under-monitor test.
-      # RS-M8: the two web-span suites are recorded against real Hex
+      # RS-M8: the three web-span suites are recorded against real Hex
       # packages, so their edge fetches them first. Every other suite runs
       # entirely offline and must keep doing so.
       let prepare =
-        if t in ["plug_requests_test", "phoenix_requests_test"]:
+        if t in [
+          "plug_requests_test", "phoenix_requests_test", "nested_requests_test"
+        ]:
           "bash scripts/prepare-web-fixtures.sh && "
         else:
           ""

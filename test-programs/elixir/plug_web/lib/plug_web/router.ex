@@ -62,6 +62,17 @@ defmodule PlugWeb.Router do
     respond(conn, 200, "cohort " <> slot <> "\n")
   end
 
+  # The nesting route.  The handler serves a whole second request through the
+  # same endpoint, synchronously, on this very process — the "proxy-style
+  # handler [that] can serve one request inside another" the session's
+  # `open_spans` comment names.  It then does more traced work, so the outer
+  # request's step range must keep growing after the inner span settles.
+  get "/proxy/:target" do
+    inner_status = PlugWeb.Nested.serve_inner("/" <> target)
+    total = PlugWeb.Nested.after_inner_work(nested_work_calls())
+    respond(conn, 200, "proxied #{inner_status} #{total}\n")
+  end
+
   get "/boom" do
     _ = conn
     raise "demo handler failure"
@@ -75,6 +86,16 @@ defmodule PlugWeb.Router do
     conn
     |> put_resp_content_type("text/plain")
     |> send_resp(status, body)
+  end
+
+  # How many traced calls the outer handler makes AFTER its inner request has
+  # settled.  Transcribed by `tests/integration/nested_requests_test.exs`,
+  # which requires the outer span to grow by at least this much minus slack.
+  defp nested_work_calls do
+    case System.get_env("CT_PLUG_WEB_NESTED_CALLS") do
+      nil -> 25
+      value -> String.to_integer(value)
+    end
   end
 
   defp slow_ms do

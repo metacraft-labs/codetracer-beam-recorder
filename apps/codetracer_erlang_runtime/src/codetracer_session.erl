@@ -40,13 +40,20 @@
     %%                  many requests in sequence, and a proxy-style handler
     %%                  can serve one request inside another, so "the open span
     %%                  of this process" is not a well-defined thing to look up.
-    %% web_traced_pids -- PidText => true for request processes this session
-    %%                  turned `call' tracing on for. Cowboy and Bandit spawn
-    %%                  their connection processes from the ranch/thousand
+    %% web_traced_pids -- PidText => OpenSpanCount for request processes this
+    %%                  session turned `call' tracing on for. Cowboy and Bandit
+    %%                  spawn their connection processes from the ranch/thousand
     %%                  island supervision tree, NOT from the recorded root
     %%                  process, so `set_on_spawn' never reaches them: without
     %%                  this the request would produce no steps at all and the
     %%                  span would bind to an empty range.
+    %%                  It is a COUNT rather than a flag because tracing is a
+    %%                  property of the pid while a span is a property of the
+    %%                  request: a proxy-style handler serving one request
+    %%                  inside another has two open spans on one pid, and
+    %%                  turning tracing off when the inner one settles would
+    %%                  silence the rest of the outer request. Tracing is
+    %%                  turned off only when the last span on the pid settles.
     next_span_id = 1,
     open_spans = #{},
     web_traced_pids = #{}
@@ -586,24 +593,30 @@ force_thread_switch(File, Pid, ThreadId, State) ->
     ),
     State#state{last_thread_id = ThreadId}.
 
+%% Reference-counted per pid: see the `web_traced_pids' note on the state
+%% record. The count is of OPEN SPANS on the pid, not of calls to these two
+%% functions -- `web_request_stop' only reaches the disable when it actually
+%% settles a span, so a doubly-settled request cannot decrement twice.
 enable_web_request_tracing(Pid, State = #state{web_traced_pids = Traced}) ->
     PidText = pid_to_list(Pid),
-    case maps:is_key(PidText, Traced) of
-        true ->
-            State;
-        false ->
+    case maps:get(PidText, Traced, 0) of
+        0 ->
             _ = catch erlang:trace(Pid, true, web_request_trace_flags()),
-            State#state{web_traced_pids = maps:put(PidText, true, Traced)}
+            State#state{web_traced_pids = maps:put(PidText, 1, Traced)};
+        Open ->
+            State#state{web_traced_pids = maps:put(PidText, Open + 1, Traced)}
     end.
 
 disable_web_request_tracing(Pid, State = #state{web_traced_pids = Traced}) ->
     PidText = pid_to_list(Pid),
-    case maps:is_key(PidText, Traced) of
-        false ->
+    case maps:get(PidText, Traced, 0) of
+        0 ->
             State;
-        true ->
+        1 ->
             _ = catch erlang:trace(Pid, false, web_request_trace_disable_flags()),
-            State#state{web_traced_pids = maps:remove(PidText, Traced)}
+            State#state{web_traced_pids = maps:remove(PidText, Traced)};
+        Open ->
+            State#state{web_traced_pids = maps:put(PidText, Open - 1, Traced)}
     end.
 
 %% Metadata arrives as a proplist of `{Key, Value}' iodata pairs and is written
