@@ -18,7 +18,6 @@ on:
 
 jobs:
   hex-bundling:
-    # HOLD (CIP-5 Wave 4): STEP-RISKY — DIY setup-nim/setup-beam toolchain not portable to NixOS eph-linux-x64
     runs-on: eph-linux-x64
     name: hex bundling smoke-test
     steps:
@@ -41,28 +40,18 @@ jobs:
           path: codetracer-launcher
           gh-token: ${{ steps.app-token.outputs.token }}
 
-      - name: Install Nim
-        uses: jiro4989/setup-nim-action@v2
-        with:
-          nim-version: "2.2.4"
-
-      - name: Install musl-tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
       - name: Build launcher
         working-directory: codetracer-launcher
-        run: bash ./build.sh --target linux-musl-x86_64 --out launcher
-
-      - name: Set up Erlang/Elixir
-        uses: erlef/setup-beam@v1
-        with:
-          otp-version: '27.0'
-          elixir-version: '1.17'
+        # The launcher's build.sh cross-compiles the musl target via
+        # `zig cc`, so Nim + Zig from nixpkgs replace the GitHub-hosted
+        # setup-nim-action + apt-get musl-tools (neither works on the
+        # self-hosted NixOS eph-linux-x64 runner).
+        run: nix shell nixpkgs#nim nixpkgs#zig -c bash ./build.sh --target linux-musl-x86_64 --out launcher
 
       - name: Pre-install Hex + rebar locally
-        run: |
-          mix local.hex --force
-          mix local.rebar --force
+        # Erlang/Elixir from nixpkgs replace erlef/setup-beam; hex + rebar
+        # are installed into ~/.mix the same way setup-beam would.
+        run: nix shell nixpkgs#erlang nixpkgs#elixir -c bash -c 'mix local.hex --force && mix local.rebar --force'
 
       - name: Build bundled hex package
         working-directory: codetracer-launcher/packaging/hex
@@ -74,7 +63,7 @@ jobs:
           # The launcher's build_hex.exs vendors this tree under
           # priv/recorder/ inside the produced .tar.
           CT_RECORDER_SRC: ${{ github.workspace }}/codetracer-beam-recorder/lib
-        run: elixir build_hex.exs --out dist
+        run: nix shell nixpkgs#erlang nixpkgs#elixir -c elixir build_hex.exs --out dist
 
       - name: Smoke-test the hex package
         working-directory: codetracer-launcher/packaging/hex

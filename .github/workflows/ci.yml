@@ -154,37 +154,46 @@ jobs:
   # matrix below is the v1 ecosystem coverage baseline.
   ecosystem-matrix:
     name: matrix (otp ${{ matrix.otp }} / elixir ${{ matrix.elixir }})
-    # HOLD (CIP-5 Wave 4): STEP-RISKY — DIY setup-beam toolchain not portable to NixOS eph-linux-x64
     runs-on: eph-linux-x64
     strategy:
       fail-fast: false
       matrix:
+        # Each leg pins its (OTP, Elixir) pair via nixpkgs beam package
+        # sets instead of the GitHub-hosted erlef/setup-beam (which cannot
+        # run on the self-hosted NixOS eph-linux-x64 runner). Elixir
+        # versions match exactly; nixpkgs only exposes major-version
+        # erlang attrs, so OTP tracks the latest patch of that major:
+        #   * erlang_26 -> 26.2.5.x  (matches the intended OTP 26.2 line)
+        #   * erlang_27 -> 27.3.x    (drift: intended 27.1, nearest is 27.3)
         include:
           - otp: "26.2"
             elixir: "1.16.3"
+            erlang-attr: "beam.packages.erlang_26.erlang"
+            elixir-attr: "beam.packages.erlang_26.elixir_1_16"
           - otp: "27.1"
             elixir: "1.17.3"
+            erlang-attr: "beam.packages.erlang_27.erlang"
+            elixir-attr: "beam.packages.erlang_27.elixir_1_17"
     steps:
       - uses: actions/checkout@v4
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: ${{ matrix.otp }}
-          elixir-version: ${{ matrix.elixir }}
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy, rustfmt
-      - uses: extractions/setup-just@v2
-      - name: Install zstd + capnproto + jq + shellcheck + shfmt
+      - name: Build + test under OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }} (nixpkgs toolchain)
+        # nixpkgs provides the whole toolchain the GitHub-hosted actions
+        # (setup-beam / setup-rust-toolchain / setup-just) and apt-get used
+        # to install, so the leg runs on the NixOS runner. hex + rebar are
+        # installed the way setup-beam did by default.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y zstd libzstd-dev capnproto pkg-config jq shellcheck
-          # shfmt installed via go binary cache; not strictly needed for
-          # the matrix run since `just lint` is covered by the dedicated
-          # `lint` job above.
-      - name: Build recorder + rebar3 plugin
-        run: just build
-      - name: Run integration tests under OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }}
-        run: just test-integration
+          nix shell \
+            "nixpkgs#${{ matrix.erlang-attr }}" \
+            "nixpkgs#${{ matrix.elixir-attr }}" \
+            nixpkgs#rustc nixpkgs#cargo nixpkgs#clippy nixpkgs#rustfmt \
+            nixpkgs#just nixpkgs#zstd nixpkgs#capnproto nixpkgs#pkg-config \
+            nixpkgs#jq nixpkgs#shellcheck \
+            -c bash -c '
+              mix local.hex --force
+              mix local.rebar --force
+              just build
+              just test-integration
+            '
       - name: Upload matrix logs
         if: always()
         uses: actions/upload-artifact@v4
