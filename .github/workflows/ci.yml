@@ -155,7 +155,7 @@ jobs:
   ecosystem-matrix:
     name: matrix (otp ${{ matrix.otp }} / elixir ${{ matrix.elixir }})
     # HOLD (CIP-5 Wave 4): STEP-RISKY — DIY setup-beam toolchain not portable to NixOS eph-linux-x64
-    runs-on: ubuntu-latest
+    runs-on: eph-linux-x64
     strategy:
       fail-fast: false
       matrix:
