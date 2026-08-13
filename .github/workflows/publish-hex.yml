@@ -43,17 +43,18 @@ jobs:
             echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: '27'
-          elixir-version: '1.17'
+      - name: Install Hex + rebar (nixpkgs toolchain)
+        # Erlang/Elixir from nixpkgs replace erlef/setup-beam so the job
+        # runs on the self-hosted NixOS eph-linux-x64 runner. setup-beam
+        # installed hex + rebar by default; do the same here.
+        run: nix shell nixpkgs#erlang nixpkgs#elixir -c bash -c 'mix local.hex --force && mix local.rebar --force'
 
       - name: Verify mix.exs version
         if: ${{ hashFiles('rebar3_codetracer/mix.exs') != '' }}
         run: |
           # The Hex package metadata lives under rebar3_codetracer/ in
           # this repo; adjust the path if/when the layout changes.
-          cd rebar3_codetracer && mix hex.build --unpack || mix hex.build
+          nix shell nixpkgs#erlang nixpkgs#elixir -c bash -c 'cd rebar3_codetracer && mix hex.build --unpack || mix hex.build'
 
       - name: Publish to Hex
         if: ${{ github.event_name == 'push' || inputs.dry_run != true }}
@@ -65,7 +66,7 @@ jobs:
             exit 0
           fi
           if [[ -f rebar3_codetracer/mix.exs ]]; then
-            cd rebar3_codetracer && mix hex.publish --yes
+            nix shell nixpkgs#erlang nixpkgs#elixir -c bash -c 'cd rebar3_codetracer && mix hex.publish --yes'
           else
             echo "::warning::mix.exs not found; nothing to publish."
           fi
