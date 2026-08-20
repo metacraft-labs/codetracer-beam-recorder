@@ -1,0 +1,244 @@
+# =============================================================================
+# Launcher <-> recorder compatibility contract for codetracer-beam-recorder.
+#
+# ###########################################################################
+# ## READ THIS FIRST: THIS EDGE IS BLOCKED AND IS NOT WIRED INTO ANY GATE.  ##
+# ###########################################################################
+#
+#   Running the edge today FAILS, and it fails for a real reason.  This file
+#   is the contract that made that reason visible, and it is checked in for
+#   exactly that purpose; it is deliberately NOT referenced by any CI workflow
+#   (there is no `launcher-recorder-e2e.yml` caller in this repo, and no `beam`
+#   row in the launcher or desktop fan-out matrices) until the defect below is
+#   fixed.  See milestone LRC-4 in
+#   codetracer-specs/Testing/Launcher-Recorder-Compatibility-Tests.milestones.org.
+#
+#   WHAT `ct record <program>.ex` DOES TODAY.  It exits 0, prints a
+#   `recordingId:`, and writes an `elixir.ct` containing 2 events, 0 functions
+#   and 0 calls -- none of the recorded program's own output or code.  `ct`
+#   reports a successful recording that recorded nothing.  Observed with
+#   `bash ci/test/launcher-recorder-e2e.sh codetracer-beam-recorder beam`:
+#   `scenarios: 4  assertions: 40  passed: 32  failed: 8`, the eight failures
+#   being `decoded only 2 events`, `the decoded trace reports a zero count`,
+#   the three expected functions, both recorded-stdout lines, and
+#   `'--source-dir' was not honoured`.
+#
+#   WHY.  The desktop core and this recorder disagree about the LAUNCH COMMAND,
+#   and neither side ever found out because nothing exercised the pair:
+#
+#     * codetracer/src/ct/trace/recorder_dispatch.nim builds, for `LangElixir`,
+#         codetracer-beam-recorder record --out-dir D --source-dir S
+#             -- elixir <program>
+#       and for `LangErlang` the same with `-- escript <program>`.
+#     * this recorder's `is_beam_target()` (src/main.rs) matches only
+#         "mix" | "erl" | "rebar3"
+#       so `elixir` is classified NON-BEAM: no runtime injection, no
+#       instrumentation, no source bundling -- and, critically, no error.
+#
+#   IT IS NOT A ONE-LINE FIX, and this milestone deliberately did not attempt
+#   one.  Teaching `is_beam_target()` about `elixir`/`escript` (verified by
+#   experiment on a scratch build, then reverted) only moves the failure:
+#     * `-- elixir <file>.ex` then fails `compile_failure: no Erlang sources
+#       were compiled into instrumented ebin` -- Elixir instrumentation lives
+#       in the Mix compiler task `compile.codetracer`, not in the standalone
+#       build path `--source-dir` uses;
+#     * `-- escript <file>.erl` gets FURTHER (the sources really are
+#       instrumented and bundled into `<out-dir>/files/`) and then fails
+#       `runtime_bootstrap_failed: unsupported BEAM target for M4 runtime
+#       injection: escript` -- `prepare_target()` implements
+#       `prepare_mix_target` / `prepare_erl_target` / `prepare_rebar3_target`
+#       and nothing else.
+#
+#   SO SOMEBODY HAS TO DECIDE, and write it down in
+#   codetracer-specs/Recorder-CLI-Conventions.md and CodeTracer-Launcher.md,
+#   which of these is the contract:
+#     (a) this recorder gains `elixir` / `escript` launch targets (a real
+#         feature: code-path injection plus Elixir standalone instrumentation),
+#         and `ct record foo.ex` keeps meaning "record this one file"; or
+#     (b) the desktop core stops pretending a single `.ex`/`.erl` file is
+#         recordable and drives `mix` / `rebar3` against the enclosing project
+#         instead -- which needs the folder-recording route that is ITSELF
+#         blocked on the launcher's dot-less-argument gap (the native edge's
+#         blocker), so the two decisions are related.
+#   Until then the honest state of `record .ex .exs .erl .hrl` in
+#   codetracer/resources/codetracer-desktop-capabilities is "the launcher routes
+#   it and the core dispatches it, but the recorder cannot execute it" -- which
+#   the capability-file test (LRC-1) cannot see, because it checks that a
+#   dispatch branch EXISTS, not that the recorder on the other end accepts what
+#   the branch sends.
+#
+#   Everything below is written for the day that is fixed, and is correct as a
+#   statement of intent: the routing half already works end to end (the launcher
+#   routes `.ex`, the core dispatches the BEAM recorder, the recorder is found
+#   and answers `--version`), and 32 of the 40 assertions pass.  Do not "fix"
+#   the fixture by lowering `min-events`, dropping the expected functions or
+#   removing `--source-dir`: that would convert a true red into the vacuous
+#   pass this whole gate exists to prevent.
+#
+# WHAT THIS FILE IS
+#   The checked-in contract between this recorder and the `ct` launcher, read
+#   at test time by the shared end-to-end driver
+#   `codetracer/ci/test/launcher-recorder-e2e.sh`
+#   (design: codetracer-specs/Testing/Launcher-Recorder-Compatibility-Tests.md
+#   §5.6; this edge is milestone LRC-4, the schema is LRC-2's).
+#
+#   The driver builds the real launcher, the real desktop core and this
+#   recorder, stages the real `codetracer-desktop` component bundle, and then
+#   runs each scenario below through the LAUNCHER binary, validating the
+#   produced trace with `ct-print` from codetracer-trace-format-nim.
+#
+#   Everything the driver asserts comes from this file.  That is the point: if
+#   this recorder changes its CLI, its output layout, the extensions it must be
+#   routed for, or the shape of the traces it produces, this file has to change
+#   in the SAME commit -- and the launcher/desktop side finds out on its next
+#   cross-repo run instead of silently diverging.
+#
+#   The schema (`launcher-compat/v1`) is documented normatively in the header of
+#   codetracer-python-recorder/cross-repo/launcher-compat.yml.  Read that file
+#   for the YAML subset, the key list and the rules `validate_fixture()`
+#   enforces; only what is SPECIFIC TO THE BEAM is explained here.
+#
+# WHICH EXTENSION THIS EDGE EXERCISES
+#   LRC-1 made codetracer/resources/codetracer-desktop-capabilities declare
+#   `.ex .exs .erl .hrl` for `record`, and the core maps `.ex`/`.exs` to
+#   `LangElixir` and `.erl`/`.hrl` to `LangErlang`.  Design §7 lists the beam
+#   row as "`.ex`/`.erl`".  The happy path below uses `.ex`, the Elixir arm,
+#   because it is the one whose recorder invocation carries BOTH flags this
+#   contract declares; the Erlang arm differs only in which runtime the `--`
+#   separator hands the program to (`escript` instead of `elixir`), which is
+#   why `discovery.runtime` names the whole BEAM toolchain rather than just the
+#   one binary this scenario happens to reach.
+#
+# WHY `discovery.method: detect-siblings`
+#   The desktop core resolves this recorder through
+#   `CODETRACER_BEAM_RECORDER_BIN` (with the legacy
+#   `CODETRACER_ELIXIR_RECORDER_BIN` alias, then a PATH search for
+#   `codetracer-beam-recorder`) -- `beamRecorderExe`,
+#   codetracer/src/common/paths.nim.  `codetracer/scripts/detect-siblings.sh`
+#   already exports that variable AND prepends `target/<profile>` for a sibling
+#   checkout, so no extra `path-prepend` is needed -- verified, not assumed: the
+#   driver asserts the `codetracer-beam-recorder` it resolved lives INSIDE this
+#   checkout.
+#
+# WHY `discovery.runtime` NAMES FIVE BINARIES
+#   `recorder_dispatch.nim` models this language's toolchain as TWO artifacts:
+#   the recorder, and the BEAM runtime `ct` hands the program to after the `--`
+#   separator (`elixir` for `LangElixir`, `escript` for `LangErlang`).  Neither
+#   codetracer dev shell declares elixir or erlang AT ALL -- not the `ci`
+#   flavour and not `default` -- and `detect-siblings.sh` does not provide them,
+#   so the driver takes them from THIS repo's own pinned dev shell, which is the
+#   one this recorder is built and tested against.  `elixirc`, `erl` and `erlc`
+#   are named alongside them because the recorder itself shells out to the BEAM
+#   compiler and emulator to build the standalone instrumented build and its
+#   runtime app; declaring only `elixir` would leave the recording to fail
+#   deeper in, with a worse diagnostic.  All five must be flake-pinned: the
+#   driver hard-fails on a runtime it cannot resolve, and equally on one that
+#   resolves to a binary outside /nix/store and outside this checkout, because
+#   `direnv exec` augments the ambient PATH rather than replacing it and would
+#   otherwise let the host's own `elixir` stand in for this flake's.
+#
+# WHY `recorder.default-out-dir: ct-traces`
+#   The driver proves the core passed `--out-dir` by showing this recorder did
+#   NOT write to its own default location.  `parse_record_options` in src/main.rs
+#   resolves `--out-dir` -> `CODETRACER_BEAM_RECORDER_OUT_DIR` (legacy alias
+#   `CODETRACER_ELIXIR_RECORDER_OUT_DIR`) -> `./ct-traces`, which is also what
+#   Recorder-CLI-Conventions.md §3 documents as the convention.
+#
+# WHY `--source-dir` IS DECLARED AS A RECORDER FLAG
+#   Because it is load-bearing here in a way it is for no other recorder.  A
+#   BEAM program is started by its build tool, so this recorder wraps a COMMAND
+#   (`-- elixir <program>`) rather than taking a script path, and it cannot
+#   infer the program's own sources from that command.  `--source-dir` is how the
+#   desktop core names them (`program.parentDir` in recorder_dispatch.nim), and
+#   its observable effect is that the recorder compiles and BUNDLES those
+#   sources into the trace directory.  Without it the recorder falls back to
+#   discovering sources under its own working directory -- which the driver
+#   deliberately makes an empty scratch directory -- so nothing would be
+#   instrumented.  The driver's `check_recorder_flag()` arm for it checks
+#   exactly that bundling, and the driver's table of such checks is closed: a
+#   flag with no check is a FAILURE, never a free green assertion.
+#
+# WHY THE SAMPLE LIVES IN A SUBDIRECTORY OF ITS OWN
+#   `--source-dir` is this file's parent directory, and the recorder compiles
+#   every BEAM source it finds there.  `cross-repo/samples/beam/` therefore holds
+#   the recorded sample ALONE; the negative-routing sample (which must never be
+#   compiled by anything) stays in `cross-repo/samples/`.
+#
+# WHY THE SAMPLE PRINTS ${CODETRACER_COMPONENT_DIR}
+#   It is the gate's only proof of hop 1 -- see the sample's own header and
+#   `validate_fixture()` in the driver.
+# =============================================================================
+
+schema: launcher-compat/v1
+
+recorder:
+  repo: codetracer-beam-recorder
+  lang: beam
+  binary: codetracer-beam-recorder
+  version-prefix: "codetracer-beam-recorder "
+  default-out-dir: ct-traces
+
+build:
+  # `just build-native` = `cargo build --locked` + the rebar3 provider compile.
+  # NOT `just build`, which re-enters `nix develop` when cargo is absent and
+  # would nest a second dev shell inside the `direnv exec` one
+  # codetracer/scripts/build-siblings.sh already provides.
+  sibling-key: codetracer-beam-recorder
+  artifact: target/debug/codetracer-beam-recorder
+
+discovery:
+  method: detect-siblings
+  runtime:
+    - elixir
+    - elixirc
+    - escript
+    - erl
+    - erlc
+
+scenarios:
+  - id: record-elixir-happy-path
+    kind: record
+    command: record
+    extension: .ex
+    sample: cross-repo/samples/beam/launcher_compat_sample.ex
+    recorder-flag:
+      - --out-dir
+      - --source-dir
+    expect:
+      exit-code: 0
+      trace-glob: "*.ct"
+      min-events: 20
+      function:
+        - LauncherCompatSample.accumulate/1
+        - LauncherCompatSample.describe_launcher_route/0
+        - LauncherCompatSample.main/0
+      stdout-contains:
+        - "launcher-recorder-e2e: total=15"
+        - "launcher-recorder-e2e: component-dir=${CODETRACER_COMPONENT_DIR}"
+
+  - id: negative-unhandled-extension
+    kind: negative-routing
+    command: record
+    extension: .rs
+    sample: cross-repo/samples/launcher_compat_unhandled.rs
+    expect:
+      exit-code: nonzero
+      stderr-contains:
+        - "no component handles"
+        - "record"
+
+  - id: launcher-version-shape
+    kind: launcher-version
+    expect:
+      exit-code: 0
+      stdout-matches: "^ct [0-9]+\.[0-9]+"
+
+  - id: empty-component-root-breaks-routing
+    kind: isolation
+    command: record
+    extension: .ex
+    sample: cross-repo/samples/beam/launcher_compat_sample.ex
+    expect:
+      exit-code: nonzero
+      stderr-contains:
+        - "no component handles"
