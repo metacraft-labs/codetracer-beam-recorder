@@ -134,14 +134,16 @@ fn record_command(subcommand: &'static str, args: Vec<String>) -> Result<i32, Re
 
             ensure_output_directory(&options.out_dir)?;
             let mut session = RecordingSession::begin(subcommand, &options)?;
-            let status = run_prepared_target(&session.prepared_target)?;
-            let code = exit_code(status);
-            session.finish(code).map_err(|error| match error.code {
-                "writer_finalization_failed" => {
-                    RecorderDiagnostic::trace_write_failed(error.detail.unwrap_or(error.message))
-                }
-                _ => error,
-            })?;
+            let outcome = run_prepared_target(&session.prepared_target)?;
+            let code = exit_code(outcome.status);
+            session
+                .finish(code, &outcome.output)
+                .map_err(|error| match error.code {
+                    "writer_finalization_failed" => RecorderDiagnostic::trace_write_failed(
+                        error.detail.unwrap_or(error.message),
+                    ),
+                    _ => error,
+                })?;
             Ok(code)
         }
     }
@@ -315,11 +317,6 @@ fn value_limit_env(value_limits: &ValueLimitOptions) -> Vec<(String, String)> {
     envs
 }
 
-fn run_target(target: &[String]) -> Result<ExitStatus, RecorderDiagnostic> {
-    let prepared = PreparedTarget::plain(target.to_vec());
-    run_prepared_target(&prepared)
-}
-
 /// Resolve a bare target command name (`mix`, `erl`, `rebar3`, …) to a
 /// concrete executable path, honoring Windows executable extensions.
 ///
@@ -388,11 +385,7 @@ fn cmd_quote(token: &str) -> String {
 }
 
 #[cfg(windows)]
-fn run_batch_via_cmd(
-    batch: &Path,
-    args: &[String],
-    envs: &[(String, String)],
-) -> Result<ExitStatus, std::io::Error> {
+fn batch_command(batch: &Path, args: &[String], envs: &[(String, String)]) -> Command {
     use std::os::windows::process::CommandExt;
 
     // `cmd /c "<line>"`: cmd strips the single outer pair of quotes and
@@ -407,13 +400,45 @@ fn run_batch_via_cmd(
     }
     line.push('"');
 
-    Command::new("cmd")
+    let mut command = Command::new("cmd");
+    command
         .raw_arg(&line)
-        .envs(envs.iter().map(|(k, v)| (k, v)))
-        .status()
+        .envs(envs.iter().map(|(k, v)| (k, v)));
+    command
 }
 
-fn run_prepared_target(target: &PreparedTarget) -> Result<ExitStatus, RecorderDiagnostic> {
+/// What the recorded program wrote while it ran.
+///
+/// The recorder forwards both streams to its own, byte for byte, so a
+/// recorded run still looks and behaves exactly like an unrecorded one —
+/// and keeps a copy, which `RecordingSession::finish` writes into the trace
+/// as `EventLogKind::Write` events. Without this the trace would describe
+/// the program's control flow but none of its OUTPUT, and "did this run
+/// really produce that line?" would be unanswerable from the trace alone.
+///
+/// These bytes are the raw stream. The copy that reaches the TRACE is
+/// normalised by [`RecordingSession::write_recorded_output`] — one event per
+/// line, lossy UTF-8 — because the trace's event model is text lines. Only
+/// the forwarding to the terminal is byte-exact; see
+/// docs/known-limitations.md.
+#[derive(Debug, Default)]
+struct RecordedOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct TargetOutcome {
+    status: ExitStatus,
+    output: RecordedOutput,
+}
+
+fn run_target(target: &[String]) -> Result<ExitStatus, RecorderDiagnostic> {
+    let prepared = PreparedTarget::plain(target.to_vec());
+    run_prepared_target(&prepared).map(|outcome| outcome.status)
+}
+
+fn run_prepared_target(target: &PreparedTarget) -> Result<TargetOutcome, RecorderDiagnostic> {
     // Resolve `.bat`/`.cmd` launchers (`mix`, `rebar3`, …) the OS process
     // launcher would otherwise miss on Windows.
     let resolved = resolve_target_command(&target.command);
@@ -427,7 +452,8 @@ fn run_prepared_target(target: &PreparedTarget) -> Result<ExitStatus, RecorderDi
             // this). Route batch launchers through `cmd /c` with a
             // hand-built, cmd-quoted command line so the expression
             // survives cmd's re-tokenization intact.
-            return run_batch_via_cmd(path, &target.args, &target.env)
+            let command = batch_command(path, &target.args, &target.env);
+            return spawn_and_tee(command)
                 .map_err(|error| RecorderDiagnostic::target_spawn_failed(&target.command, error));
         }
     }
@@ -440,9 +466,66 @@ fn run_prepared_target(target: &PreparedTarget) -> Result<ExitStatus, RecorderDi
     command
         .args(&target.args)
         .envs(target.env.iter().map(|(key, value)| (key, value)));
-    command
-        .status()
+    spawn_and_tee(command)
         .map_err(|error| RecorderDiagnostic::target_spawn_failed(&target.command, error))
+}
+
+/// Run `command` with its output piped, copying every byte through to the
+/// recorder's own stdout/stderr as it arrives while keeping a copy.
+///
+/// Streaming rather than `Command::output()` matters: a recorded program may
+/// be long-running or interactive-ish (`rebar3 shell`, a web server), and its
+/// output must appear when it happens, not at exit. Both streams are drained
+/// concurrently so neither pipe can fill up and deadlock the child.
+fn spawn_and_tee(mut command: Command) -> io::Result<TargetOutcome> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+
+    fn drain<R: Read + Send + 'static, W: Write + Send + 'static>(
+        mut reader: R,
+        mut writer: W,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut collected = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        collected.extend_from_slice(&buffer[..count]);
+                        let _ = writer.write_all(&buffer[..count]);
+                        let _ = writer.flush();
+                    }
+                }
+            }
+            collected
+        })
+    }
+
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|stream| drain(stream, io::stdout()));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|stream| drain(stream, io::stderr()));
+
+    let status = child.wait()?;
+    let stdout = stdout_handle
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+
+    Ok(TargetOutcome {
+        status,
+        output: RecordedOutput { stdout, stderr },
+    })
 }
 
 fn exit_code(status: ExitStatus) -> i32 {
@@ -562,6 +645,13 @@ struct BuildOptions {
     source_maps: Vec<PathBuf>,
     include_modules: Vec<String>,
     exclude_modules: Vec<String>,
+    /// The launcher the build is being prepared for, when known
+    /// (`record --source-dir … -- <command> …`). It selects the BEAM
+    /// toolchain the runtime app and the instrumented modules are compiled
+    /// with — see [`runtime_compiler_for_target`]. `None` for the standalone
+    /// `compile` / `instrument` subcommands, which infer it from the
+    /// discovered sources instead.
+    target_command: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -963,6 +1053,7 @@ fn parse_build_options(args: Vec<String>) -> Result<BuildParseResult, RecorderDi
         source_maps,
         include_modules,
         exclude_modules,
+        target_command: None,
     }))
 }
 
@@ -1211,11 +1302,16 @@ impl RecordingSession {
         Ok(())
     }
 
-    fn finish(&mut self, target_exit_code: i32) -> Result<(), RecorderDiagnostic> {
+    fn finish(
+        &mut self,
+        target_exit_code: i32,
+        recorded_output: &RecordedOutput,
+    ) -> Result<(), RecorderDiagnostic> {
         let runtime_result = self.runtime.read_delivery()?;
         if runtime_result.delivered {
             self.write_runtime_trace_events(&runtime_result)?;
         }
+        self.write_recorded_output(recorded_output);
         self.writer.register_special_event(
             EventLogKind::Write,
             "m4",
@@ -1237,6 +1333,32 @@ impl RecordingSession {
 
         write_trace_meta_json(self, &runtime_result, target_exit_code)
             .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
+    }
+
+    /// Record what the program wrote, one `EventLogKind::Write` event per
+    /// line, so the trace answers "what did this run print?" on its own.
+    ///
+    /// The events are appended after the runtime's own trace events rather
+    /// than interleaved with them: the recorder observes the child's pipes
+    /// from outside the BEAM and has no shared clock with the in-VM tracer,
+    /// so any claimed interleaving would be invented. Stated here rather
+    /// than papered over — see docs/launch-targets.md §"Recorded output".
+    ///
+    /// This is also where the recorded copy stops being byte-exact:
+    /// `from_utf8_lossy` replaces non-UTF-8 bytes, and `lines()` splits on
+    /// `\n` while stripping a trailing `\r`, so CRLF output loses its `\r`.
+    /// The bytes forwarded to the terminal are unaffected.
+    fn write_recorded_output(&mut self, output: &RecordedOutput) {
+        for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+            if bytes.is_empty() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(bytes);
+            for line in text.lines() {
+                self.writer
+                    .register_special_event(EventLogKind::Write, stream, line);
+            }
+        }
     }
 
     fn write_runtime_trace_events(
@@ -1622,14 +1744,53 @@ impl RecordingSession {
         Ok(())
     }
 
+    /// Write the low-level supplement — `DropVariables` and the raw
+    /// `Value`/`VariableName` records — into its own CTFS container beside
+    /// the trace.
+    ///
+    /// WHY IT IS NOT WRITTEN INTO THE TRACE ITSELF. These records exist only
+    /// here because the Nim multi-stream writer's C API cannot express them:
+    /// `NimTraceWriter::drop_variables` is a documented no-op
+    /// (codetracer-trace-format/codetracer_trace_writer_nim/src/lib.rs), so
+    /// the recorder encodes them itself in the legacy combined
+    /// `events.log` + `events.fmt` form.
+    ///
+    /// Putting that `events.log` inside the recording's own `.ct` made the
+    /// container a HYBRID: the Nim writer had produced a v4 multi-stream
+    /// container, and `ct-print` — the canonical decoder, and this project's
+    /// trace-validation oracle — diverts to its legacy combined-stream reader
+    /// for any container that has an `events.log`
+    /// (codetracer-trace-format-nim/src/codetracer_ct_print.nim, "Divert to
+    /// the legacy reader whenever a combined `events.log` is present"). That
+    /// reader then decoded the supplement instead of the trace, and failed
+    /// outright on its `HEADERV1` prefix — which the Rust CTFS writer and
+    /// reader both require and its own chunk walk does not skip:
+    ///
+    ///     Error reading events: chunk compressed data extends beyond events.log
+    ///
+    /// So EVERY instrumented BEAM recording — `erl`, `rebar3`, and now
+    /// `elixir`/`escript` — produced a `.ct` the product's own decoder
+    /// refused. Keeping the supplement in a separate container leaves the
+    /// recording a clean v4 bundle that `ct-print` reads, and loses nothing:
+    /// the supplement is still a real CTFS container, still readable with
+    /// `read_trace_from_ctfs`, and the recorder's own tests read it there.
+    ///
+    /// It is NOT named `*.ct`, because `find_single_ct_file` (and the
+    /// launcher-compat fixture's `trace-glob`) require exactly one `.ct` per
+    /// bundle.
     fn write_ctfs_runtime_events(&self) -> Result<(), RecorderDiagnostic> {
         if self.pending_drop_variable_names.is_empty() && self.pending_value_events.is_empty() {
             return Ok(());
         }
 
-        let trace_path = self.out_dir.join(format!("{}.ct", self.program_name));
+        let supplement_path = self.out_dir.join(LOW_LEVEL_EVENTS_SUPPLEMENT);
+        if let Some(parent) = supplement_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                RecorderDiagnostic::writer_finalization_failed(error.to_string())
+            })?;
+        }
         append_runtime_events_to_ctfs(
-            &trace_path,
+            &supplement_path,
             &self.pending_value_events,
             &self.pending_drop_variable_names,
         )
@@ -1637,11 +1798,28 @@ impl RecordingSession {
     }
 }
 
+/// Bundle-relative path of the low-level event supplement written by
+/// [`RecordingSession::write_ctfs_runtime_events`].
+const LOW_LEVEL_EVENTS_SUPPLEMENT: &str = "recorder_metadata/low_level_events.ctfs";
+
+/// CTFS container geometry for the supplement — the same 4 KiB block size and
+/// 31 root entries the trace-format crate's own containers use.
+const CTFS_BLOCK_SIZE: u32 = 4096;
+const CTFS_MAX_ROOT_ENTRIES: u32 = 31;
+
 fn append_runtime_events_to_ctfs(
     trace_path: &Path,
     pending_values: &[PendingValueEvent],
     drop_variable_groups: &[Vec<String>],
 ) -> Result<(), Box<dyn Error>> {
+    // The supplement container is created on first use. `CtfsWriter::create`
+    // is only reached when the file does not exist yet, so a second append to
+    // the same bundle still extends the container it finds.
+    if !trace_path.exists() {
+        let writer = CtfsWriter::create(trace_path, CTFS_BLOCK_SIZE, CTFS_MAX_ROOT_ENTRIES)?;
+        writer.close()?;
+    }
+
     let mut reader = CtfsReader::open(trace_path)?;
     let files = reader.list_files();
     let has_events_log = files.iter().any(|name| name == "events.log");
@@ -1828,6 +2006,10 @@ struct RuntimeSession {
     transformed_form_dumps: Vec<TransformedFormsDump>,
     trace_functions: Vec<TraceFunctionSpec>,
     step_locations: Vec<TraceLocationSpec>,
+    /// Standalone `.ex`/`.exs` programs compiled outside a Mix project, with
+    /// the generated entry script `prepare_elixir_target` runs in place of
+    /// the original file. Empty for every other launch target.
+    elixir_entries: Vec<ElixirEntry>,
     capture_messages: bool,
     /// M16: tracer-backend selection (default `process`).
     tracer_backend: TracerBackend,
@@ -2310,6 +2492,7 @@ impl RuntimeSession {
                     source_maps: options.source_maps.clone(),
                     include_modules: options.include_modules.clone(),
                     exclude_modules: options.exclude_modules.clone(),
+                    target_command: Some(options.target[0].clone()),
                 };
                 let build = prepare_standalone_build(&build_options)?;
                 write_standalone_build_summary(&build_dir, "record", &build)
@@ -2389,6 +2572,22 @@ impl RuntimeSession {
             (Vec::new(), Vec::new())
         };
 
+        // THE GUARD (non-standalone path). A BEAM target that produced no
+        // traceable functions would record its own lifecycle and nothing
+        // else — the "exited 0 having recorded nothing" failure this
+        // recorder must never repeat. Say so, and say where we looked.
+        if mode == RuntimeMode::Beam && trace_functions.is_empty() {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                "BEAM target '{target}' produced no traceable functions: discovered {count} \
+                 source file(s) under {root}. Pass --source-dir <dir> (or --build-dir <dir>) so \
+                 the recorder can find and instrument the program's sources; recording would \
+                 otherwise capture none of the program.",
+                target = options.target[0],
+                count = source_paths.len(),
+                root = source_root.display(),
+            )));
+        }
+
         Ok(Self {
             mode,
             session_file,
@@ -2402,6 +2601,7 @@ impl RuntimeSession {
             transformed_form_dumps: instrumentation.dumps,
             trace_functions,
             step_locations: instrumentation.locations,
+            elixir_entries: Vec::new(),
             capture_messages: options.capture_messages,
             tracer_backend: options.tracer_backend,
             tracer_queue_limit: options.tracer_queue_limit,
@@ -2414,6 +2614,16 @@ impl RuntimeSession {
         build_dir: &Path,
     ) -> Result<Self, RecorderDiagnostic> {
         let build = read_standalone_build_summary(build_dir)?;
+        // THE GUARD (prebuilt path). A summary with no traceable functions
+        // cannot produce a recording of the program, only of its lifecycle.
+        if build.trace_functions.is_empty() {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                "standalone build at {} declares no traceable functions: rebuild it with \
+                 `codetracer-beam-recorder compile --build-dir <dir> --source-dir <dir>`; \
+                 recording against it would capture none of the program",
+                build_dir.display()
+            )));
+        }
         copy_standalone_metadata_artifacts(&build, &options.out_dir)
             .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?;
         let copied_sources =
@@ -2434,6 +2644,7 @@ impl RuntimeSession {
             transformed_form_dumps: build.transformed_form_dumps,
             trace_functions: build.trace_functions,
             step_locations: build.step_locations,
+            elixir_entries: build.elixir_entries,
             capture_messages: options.capture_messages,
             tracer_backend: options.tracer_backend,
             tracer_queue_limit: options.tracer_queue_limit,
@@ -2460,8 +2671,12 @@ impl RuntimeSession {
             "mix" => self.prepare_mix_target(target, runtime_ebin),
             "erl" => self.prepare_erl_target(target, runtime_ebin, options.root_mfa.as_ref()),
             "rebar3" => self.prepare_rebar3_target(target, runtime_ebin),
+            "elixir" => self.prepare_elixir_target(target),
+            "escript" => self.prepare_escript_target(target, runtime_ebin),
             other => Err(RecorderDiagnostic::runtime_bootstrap_failed(format!(
-                "unsupported BEAM target for M4 runtime injection: {other}"
+                "unsupported BEAM target for M4 runtime injection: {other} \
+                 (supported: {supported})",
+                supported = BEAM_TARGET_COMMANDS.join(", ")
             ))),
         }?;
         prepared.env.extend(value_limit_env(&options.value_limits));
@@ -2520,7 +2735,7 @@ impl RuntimeSession {
             args.push(instrumented_ebin.display().to_string());
         }
         args.push("-eval".to_string());
-        args.push(wrap_erlang_entrypoint(&module, &function, self));
+        args.push(wrap_erlang_entrypoint(&module, &function, "[]", self));
 
         Ok(PreparedTarget {
             command: target[0].clone(),
@@ -2529,6 +2744,191 @@ impl RuntimeSession {
             injection_decision:
                 "plain erl M4 injection plus M8 instrumentation: add -pa compiled runtime ebin and instrumented ebin, replace -s entrypoint/-s init stop with an -eval wrapper that starts and stops the runtime session"
                     .to_string(),
+            entry_module: Some(module),
+        })
+    }
+
+    /// M4 runtime injection for `elixir <program>.ex [args]` — the launch
+    /// command `codetracer/src/ct/trace/recorder_dispatch.nim` builds for a
+    /// single-file Elixir recording (`LangElixir`).
+    ///
+    /// The program is NOT re-run as a script. Running `elixir foo.ex` would
+    /// recompile `foo.ex` in the target VM and shadow the instrumented
+    /// modules the build already produced, so the recording would capture
+    /// nothing again — differently, but just as silently. Instead the
+    /// standalone build split the file ahead of time (see
+    /// `run_standalone_elixir_build`): its module definitions are already
+    /// compiled and instrumented into the instrumented ebin, and its
+    /// TOP-LEVEL expressions were written to a generated entry script.
+    /// This runs that entry script through `elixir -e`, wrapped exactly like
+    /// a `mix run -e` expression: `code.add_patha` for the runtime and
+    /// instrumented ebins, then `start_session` / `stop_session` around it.
+    fn prepare_elixir_target(
+        &self,
+        target: &[String],
+    ) -> Result<PreparedTarget, RecorderDiagnostic> {
+        let Some(program) = target.get(1) else {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(
+                "the `elixir` launch target requires a program: `-- elixir <program>.ex`",
+            ));
+        };
+        if program.starts_with('-') {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                "the `elixir` launch target records a single program file, but the first \
+                 argument is the option '{program}'; use `-- mix run -e <expression>` for a \
+                 Mix project instead"
+            )));
+        }
+        let program_path = normalize_build_path(Path::new(program));
+        let entry = self
+            .elixir_entries
+            .iter()
+            .find(|entry| normalize_build_path(&entry.source_path) == program_path)
+            .ok_or_else(|| {
+                RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                    "{} was not part of the instrumented standalone Elixir build \
+                     (built programs: {built}). Pass --source-dir <the program's directory> so \
+                     the recorder compiles and instruments it.",
+                    program_path.display(),
+                    built = if self.elixir_entries.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        self.elixir_entries
+                            .iter()
+                            .map(|entry| entry.source_path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                ))
+            })?;
+        if self.instrumented_ebin.is_none() {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                "no instrumented ebin for {}: the recording would capture none of the program",
+                program_path.display()
+            )));
+        }
+
+        let entry_expression = format!(
+            "Code.require_file({})",
+            elixir_string(&entry.entry_path.display().to_string())
+        );
+        let mut args = vec![
+            "-e".to_string(),
+            wrap_elixir_expression(&entry_expression, self),
+        ];
+        // Extra arguments the caller put after the program keep reaching the
+        // program as `System.argv/0`; `--` stops `elixir`'s own option parsing.
+        if target.len() > 2 {
+            args.push("--".to_string());
+            args.extend(target[2..].iter().cloned());
+        }
+
+        Ok(PreparedTarget {
+            command: target[0].clone(),
+            args,
+            env: Vec::new(),
+            injection_decision: format!(
+                "elixir M4 injection: run the generated entry script {} through `elixir -e` \
+                 with code.add_patha for the compiled runtime ebin and the instrumented ebin, \
+                 wrapped in start_session/stop_session; the program's {module_count} module(s) \
+                 were compiled and instrumented ahead of time",
+                entry.entry_path.display(),
+                module_count = entry.modules.len()
+            ),
+            entry_module: None,
+        })
+    }
+
+    /// M4 runtime injection for `escript <program>.erl [args]` — the launch
+    /// command the desktop core builds for a single-file Erlang recording
+    /// (`LangErlang`).
+    ///
+    /// `escript` compiles the `.erl` source itself and calls `main/1`, and it
+    /// offers no way to put an ebin on the code path (its emulator flags come
+    /// from the script's own `%%!` line, which we must not rewrite). So the
+    /// prepared target switches the launcher to `erl`, which is what `escript`
+    /// is a thin wrapper over, and reproduces its contract exactly:
+    /// `Module:main(Args)` with the same argument list, run with the runtime
+    /// and instrumented ebins on the code path and inside a recording session.
+    fn prepare_escript_target(
+        &self,
+        target: &[String],
+        runtime_ebin: &Path,
+    ) -> Result<PreparedTarget, RecorderDiagnostic> {
+        let Some(program) = target.get(1) else {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(
+                "the `escript` launch target requires a program: `-- escript <program>.erl`",
+            ));
+        };
+        let program_path = Path::new(program);
+        if program_path.extension().and_then(|value| value.to_str()) != Some("erl") {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                "the `escript` launch target only records `.erl` sources, got {program}. \
+                 An escript archive or a shebang script carries no instrumentable source the \
+                 recorder can compile; record the project with `-- rebar3 shell --eval …` or \
+                 the module with `-- erl -s <module> <function>` instead."
+            )));
+        }
+        let module = program_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| {
+                RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                    "cannot derive an Erlang module name from {program}"
+                ))
+            })?
+            .to_string();
+
+        let Some(instrumented_ebin) = &self.instrumented_ebin else {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                "no instrumented ebin for {program}: the recording would capture none of the \
+                 program. Pass --source-dir <the program's directory>."
+            )));
+        };
+        let instrumented_beam = instrumented_ebin.join(format!("{module}.beam"));
+        if !instrumented_beam.is_file() {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                "{program} was not instrumented: expected {} in the instrumented ebin. \
+                 Pass --source-dir <the program's directory> so the recorder compiles it.",
+                instrumented_beam.display()
+            )));
+        }
+
+        let script_args = target[2..].to_vec();
+        let mut args = vec![
+            "-noshell".to_string(),
+            "-pa".to_string(),
+            runtime_ebin.display().to_string(),
+            "-pa".to_string(),
+            instrumented_ebin.display().to_string(),
+            "-eval".to_string(),
+            // escript's entry point is `main/1`, and its single argument is
+            // the script's argument LIST — so the `apply/3` argument list has
+            // exactly one element, which is itself a list of strings.
+            wrap_erlang_entrypoint(
+                &module,
+                "main",
+                &format!("[{}]", erlang_string_vec(&script_args)),
+                self,
+            ),
+        ];
+        // `escript` gives the script the emulator's own `-extra` arguments as
+        // well; keep them reachable through `init:get_plain_arguments/0`.
+        if !script_args.is_empty() {
+            args.push("-extra".to_string());
+            args.extend(script_args);
+        }
+
+        Ok(PreparedTarget {
+            // `escript` cannot take `-pa`; `erl` is the emulator it wraps.
+            command: "erl".to_string(),
+            args,
+            env: Vec::new(),
+            injection_decision: format!(
+                "escript M4 injection: run the instrumented {module}:main/1 under `erl -noshell` \
+                 with -pa for the compiled runtime ebin and the instrumented ebin, inside an \
+                 -eval wrapper that starts and stops the runtime session"
+            ),
             entry_module: Some(module),
         })
     }
@@ -3277,21 +3677,51 @@ fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+/// The launch targets this recorder knows how to instrument and inject into.
+///
+/// Three of them are BUILD TOOLS (`mix`, `rebar3`) or the raw emulator
+/// (`erl`); the other two are the SCRIPT RUNNERS the CodeTracer desktop core
+/// dispatches for a single-file recording — `codetracer/src/ct/trace/
+/// recorder_dispatch.nim` builds `… -- elixir <program>` for `LangElixir`
+/// (`.ex`/`.exs`) and `… -- escript <program>` for `LangErlang`
+/// (`.erl`/`.hrl`).
+///
+/// Anything not in this table is treated as a non-BEAM command and run
+/// verbatim without instrumentation.  Adding a name here without also adding
+/// a `prepare_*_target` arm is a hard error at record time, never a silent
+/// pass-through — see `RuntimeSession::prepare_target`.
+const BEAM_TARGET_COMMANDS: [&str; 5] = ["mix", "erl", "rebar3", "elixir", "escript"];
+
 fn is_beam_target(target_command: &str) -> bool {
-    matches!(
-        target_program_name(target_command).as_str(),
-        "mix" | "erl" | "rebar3"
-    )
+    BEAM_TARGET_COMMANDS.contains(&target_program_name(target_command).as_str())
 }
 
 /// Pick the BEAM source language to record in `trace_meta.json` based on the
-/// target launcher. Mix-driven runs are Elixir-first; plain `erl` and rebar3
-/// runs are Erlang-first. Non-BEAM and unknown targets keep the legacy
-/// "elixir" default for backward compatibility with M2/M3 fixtures.
+/// target launcher. Mix-driven and `elixir`-driven runs are Elixir-first;
+/// plain `erl`, rebar3 and `escript` runs are Erlang-first (the core only
+/// reaches `escript` for `.erl`/`.hrl` programs). Non-BEAM and unknown
+/// targets keep the legacy "elixir" default for backward compatibility with
+/// M2/M3 fixtures.
 fn detect_target_language(target_command: &str) -> &'static str {
     match target_program_name(target_command).as_str() {
-        "erl" | "rebar3" => "erlang",
+        "erl" | "rebar3" | "escript" => "erlang",
         _ => "elixir",
+    }
+}
+
+/// Which BEAM compiler builds the CodeTracer runtime app (and, for Elixir,
+/// the user's modules) for a given launch target.
+///
+/// This is not cosmetic. A dev shell can pin `elixir` against one OTP
+/// release and `erl`/`erlc`/`escript` against another (this repo's shell
+/// pins Elixir 1.18 on OTP 27 and Erlang 28); a BEAM file emitted by the
+/// newer `erlc` cannot be loaded by the older emulator. Compiling the
+/// runtime with the same toolchain that will RUN it keeps the two ends on
+/// one OTP release.
+fn runtime_compiler_for_target(target_command: &str) -> RuntimeCompiler {
+    match target_program_name(target_command).as_str() {
+        "mix" | "elixir" => RuntimeCompiler::Elixir,
+        _ => RuntimeCompiler::Erlc,
     }
 }
 
@@ -3313,6 +3743,41 @@ struct StandaloneBuildSummary {
     transformed_form_dumps: Vec<TransformedFormsDump>,
     trace_functions: Vec<TraceFunctionSpec>,
     step_locations: Vec<TraceLocationSpec>,
+    /// One record per standalone `.ex`/`.exs` source compiled outside a Mix
+    /// project: which modules it defined, and where the generated entry
+    /// script holding its TOP-LEVEL expressions was written.
+    ///
+    /// `prepare_elixir_target` runs that entry script — not the original
+    /// file — so the instrumented modules on the code path are the ones the
+    /// program calls. Empty for Mix builds and for Erlang-only builds.
+    #[serde(default)]
+    elixir_entries: Vec<ElixirEntry>,
+}
+
+/// The `elixir` launch target's ahead-of-time split of one `.ex`/`.exs`
+/// program: `modules` were compiled and instrumented into the build's
+/// instrumented ebin, `entry_path` holds everything else.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ElixirEntry {
+    #[serde(default)]
+    schema: String,
+    source_path: PathBuf,
+    entry_path: PathBuf,
+    #[serde(default)]
+    expression: String,
+    #[serde(default)]
+    modules: Vec<String>,
+}
+
+fn is_elixir_source(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("ex" | "exs")
+    )
+}
+
+fn is_erlang_source(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("erl")
 }
 
 #[derive(Clone, Debug)]
@@ -3347,33 +3812,148 @@ fn prepare_standalone_build(
                 RecorderDiagnostic::module_filter_mismatch(message)
             }
         })?;
-    let runtime_ebin = compile_runtime_app(&options.build_dir, "erl")
+
+    // WHICH `.ex` FILES THIS BUILD COMPILES, and why it is not "all of them".
+    //
+    // `--source-dir` means different things per launch target, and only the
+    // `elixir` target makes the recorder responsible for compiling Elixir:
+    //
+    //   * `mix`    — Mix compiles the project; `mix compile.codetracer`
+    //                instruments it. The recorder must not compile it again.
+    //   * `rebar3` — an Erlang project. A `.ex` under `--source-dir` there is
+    //                a source-map ORIGINAL (see
+    //                test-programs/erlang/rebar3_app/lib/original_generated.ex),
+    //                never a compilation unit.
+    //   * `erl` / `escript` — Erlang programs.
+    //   * `elixir` — the single-file Elixir program IS the compilation unit,
+    //                and nothing else will compile it. This is the case
+    //                `run_standalone_elixir_build` exists for.
+    //
+    // The standalone `compile`/`instrument` subcommands carry no target and
+    // keep the pre-existing behaviour: `.ex` files contribute trace functions
+    // through source scanning, not through compilation.
+    let compiles_elixir = options
+        .target_command
+        .as_deref()
+        .map(|command| target_program_name(command) == "elixir")
+        .unwrap_or(false);
+    let elixir_sources = if compiles_elixir {
+        filtered_source_paths
+            .iter()
+            .filter(|path| is_elixir_source(path))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let erlang_sources = filtered_source_paths
+        .iter()
+        .filter(|path| is_erlang_source(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    // Everything the Elixir half does NOT own. Identical to the full
+    // discovered set for every target but `elixir`, which is what keeps the
+    // other four targets on exactly the path they were on before.
+    let non_elixir_sources = filtered_source_paths
+        .iter()
+        .filter(|path| !compiles_elixir || !is_elixir_source(path))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    // The runtime app has to be compiled by the toolchain that will LOAD it.
+    // With a launch target we know which one that is; the standalone
+    // `compile`/`instrument` subcommands have always used `erlc`.
+    let runtime_compiler = match options.target_command.as_deref() {
+        Some(target_command) => runtime_compiler_for_target(target_command),
+        None => RuntimeCompiler::Erlc,
+    };
+    let runtime_ebin = compile_runtime_app_with(&options.build_dir, runtime_compiler)
         .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+
+    // Elixir half. Compiled by the Elixir compiler itself (there is no Mix
+    // project to host `mix compile.codetracer`), then instrumented through
+    // the same `codetracer_forms` abstract-forms transform the Erlang half
+    // uses — see docs/launch-targets.md.
+    let elixir_build = if elixir_sources.is_empty() {
+        None
+    } else {
+        Some(run_standalone_elixir_build(
+            options,
+            &source_root,
+            &elixir_sources,
+            &runtime_ebin,
+        )?)
+    };
+
+    // Erlang half, unchanged: `.erl` sources go straight to
+    // `codetracer_forms:instrument_file/4`.
     let instrumentation = instrument_erlang_sources(
         &options.build_dir,
         &source_root,
-        &filtered_source_paths,
+        &non_elixir_sources,
         &runtime_ebin,
         &source_maps,
         Some(&selection),
     )
     .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
-    let trace_functions =
-        discover_trace_functions(&source_root, &filtered_source_paths, &source_maps)
+    let erlang_trace_functions =
+        discover_trace_functions(&source_root, &non_elixir_sources, &source_maps)
             .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
-    let (manifests, source_map_artifacts) = write_recorder_metadata(
+    let (mut manifests, mut source_map_artifacts) = write_recorder_metadata(
         &options.build_dir,
         &source_root,
-        &trace_functions,
+        &erlang_trace_functions,
         &instrumentation.locations,
         &instrumentation.variable_slot_templates,
         &source_maps,
         &instrumentation.dumps,
     )
     .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
-    let instrumented_ebin = instrumentation.ebin_dir.ok_or_else(|| {
-        RecorderDiagnostic::compile_failed("no Erlang sources were compiled into instrumented ebin")
+
+    let mut trace_functions = erlang_trace_functions;
+    let mut step_locations = instrumentation.locations;
+    let mut transformed_form_dumps = instrumentation.dumps;
+    let mut instrumented_ebin = instrumentation.ebin_dir;
+    let mut elixir_entries = Vec::new();
+
+    if let Some(build) = elixir_build {
+        instrumented_ebin = Some(build.instrumented_ebin.clone());
+        manifests.extend(build.manifests);
+        source_map_artifacts.extend(build.source_maps);
+        transformed_form_dumps.extend(build.transformed_form_dumps);
+        trace_functions.extend(build.trace_functions);
+        step_locations.extend(build.step_locations);
+        elixir_entries = build.elixir_entries;
+    }
+
+    // THE GUARD. Reaching here with nothing instrumented means the recorder
+    // would go on to produce a trace describing none of the program — the
+    // silent-incompleteness pattern codetracer-specs/CLI/ct/record.md forbids.
+    // Fail, and name what was looked at.
+    let instrumented_ebin = instrumented_ebin.ok_or_else(|| {
+        RecorderDiagnostic::compile_failed(format!(
+            "no BEAM sources were compiled into an instrumented ebin: \
+             {source_count} discovered source(s) under {source_dirs} \
+             ({erlang_count} Erlang, {elixir_count} compilable Elixir) yielded nothing \
+             to instrument",
+            source_count = filtered_source_paths.len(),
+            source_dirs = options
+                .source_dirs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            erlang_count = erlang_sources.len(),
+            elixir_count = elixir_sources.len(),
+        ))
     })?;
+    if trace_functions.is_empty() {
+        return Err(RecorderDiagnostic::compile_failed(format!(
+            "instrumented ebin {} contains no traceable functions: the recording would be empty",
+            instrumented_ebin.display()
+        )));
+    }
+
     Ok(StandaloneBuildSummary {
         schema: "codetracer.beam.standalone-build.v1".to_string(),
         build_dir: options.build_dir.clone(),
@@ -3382,10 +3962,121 @@ fn prepare_standalone_build(
         instrumented_ebin,
         manifests,
         source_maps: source_map_artifacts,
-        transformed_form_dumps: instrumentation.dumps,
+        transformed_form_dumps,
         trace_functions,
-        step_locations: instrumentation.locations,
+        step_locations,
+        elixir_entries,
     })
+}
+
+/// JSON handed to `scripts/standalone-elixir-build.exs`.
+#[derive(Serialize)]
+struct StandaloneElixirBuildSpec<'a> {
+    schema: &'static str,
+    build_dir: &'a Path,
+    source_root: &'a Path,
+    sources: &'a [PathBuf],
+    runtime_ebin: &'a Path,
+    summary_path: &'a Path,
+    include_modules: &'a [String],
+    exclude_modules: &'a [String],
+}
+
+/// Compile and instrument loose `.ex`/`.exs` sources with no Mix project in
+/// sight.
+///
+/// The work happens inside `elixir` rather than here because only the Elixir
+/// compiler can parse Elixir, and because the instrumented modules must be
+/// emitted by the same OTP release that will load them. The Rust side owns
+/// the build directory layout and merges the result; see
+/// docs/launch-targets.md for why the alternatives (a throwaway Mix project,
+/// or `elixirc` over the whole file) were rejected.
+fn run_standalone_elixir_build(
+    options: &BuildOptions,
+    source_root: &Path,
+    elixir_sources: &[PathBuf],
+    runtime_ebin: &Path,
+) -> Result<StandaloneBuildSummary, RecorderDiagnostic> {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = repo_root.join("scripts/standalone-elixir-build.exs");
+    if !script.is_file() {
+        return Err(RecorderDiagnostic::compile_failed(format!(
+            "standalone Elixir build driver is missing at {}",
+            script.display()
+        )));
+    }
+
+    let spec_path = options.build_dir.join("standalone_elixir_spec.json");
+    let summary_path = options.build_dir.join("standalone_elixir_build.json");
+    fs::create_dir_all(&options.build_dir)
+        .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+    let spec = StandaloneElixirBuildSpec {
+        schema: "codetracer.beam.standalone-elixir-spec.v1",
+        build_dir: &options.build_dir,
+        source_root,
+        sources: elixir_sources,
+        runtime_ebin,
+        summary_path: &summary_path,
+        include_modules: &options.include_modules,
+        exclude_modules: &options.exclude_modules,
+    };
+    let spec_json = serde_json::to_vec_pretty(&spec)
+        .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+    fs::write(&spec_path, spec_json)
+        .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+
+    let output = run_beam_tool(
+        "elixir",
+        &[
+            "-pa",
+            &runtime_ebin.display().to_string(),
+            &script.display().to_string(),
+            &spec_path.display().to_string(),
+        ],
+    )
+    .map_err(|error| {
+        RecorderDiagnostic::compile_failed(format!(
+            "failed to run the standalone Elixir build driver ({}): {error}",
+            script.display()
+        ))
+    })?;
+    if !output.status.success() {
+        return Err(RecorderDiagnostic::compile_failed(format!(
+            "standalone Elixir build failed with status {:?} for {}\n{}{}",
+            output.status.code(),
+            elixir_sources
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    let text = fs::read_to_string(&summary_path).map_err(|error| {
+        RecorderDiagnostic::compile_failed(format!(
+            "standalone Elixir build reported success but wrote no summary at {}: {error}",
+            summary_path.display()
+        ))
+    })?;
+    let mut summary: StandaloneBuildSummary = serde_json::from_str(&text).map_err(|error| {
+        RecorderDiagnostic::compile_failed(format!(
+            "unreadable standalone Elixir build summary at {}: {error}",
+            summary_path.display()
+        ))
+    })?;
+    if summary.schema != "codetracer.beam.standalone-build.v1" {
+        return Err(RecorderDiagnostic::compile_failed(format!(
+            "unsupported standalone Elixir build schema {} in {}",
+            summary.schema,
+            summary_path.display()
+        )));
+    }
+    for path in &mut summary.source_paths {
+        *path = normalize_build_path(path);
+    }
+    Ok(summary)
 }
 
 fn write_standalone_build_summary(
@@ -3465,16 +4156,18 @@ fn read_standalone_build_summary(
 }
 
 fn compile_runtime_app(out_dir: &Path, target_command: &str) -> Result<PathBuf, Box<dyn Error>> {
+    compile_runtime_app_with(out_dir, runtime_compiler_for_target(target_command))
+}
+
+fn compile_runtime_app_with(
+    out_dir: &Path,
+    compiler: RuntimeCompiler,
+) -> Result<PathBuf, Box<dyn Error>> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let src_dir = repo_root.join("apps/codetracer_erlang_runtime/src");
     let build_dir = out_dir.join("runtime").join(RUNTIME_APP_NAME);
     let ebin_dir = build_dir.join("ebin");
     fs::create_dir_all(&ebin_dir)?;
-    let compiler = if target_program_name(target_command) == "mix" {
-        RuntimeCompiler::Elixir
-    } else {
-        RuntimeCompiler::Erlc
-    };
 
     for module in [
         "codetracer_erlang_runtime.erl",
@@ -4739,12 +5432,23 @@ fn wrap_elixir_expression(expression: &str, runtime: &RuntimeSession) -> String 
     )
 }
 
-fn wrap_erlang_entrypoint(module: &str, function: &str, runtime: &RuntimeSession) -> String {
+/// Wrap `Module:Function(Args)` in a recording session.
+///
+/// `args_literal` is an Erlang term source string for the argument LIST:
+/// `"[]"` for the `erl -s Module Function` contract (arity 0) and
+/// `["arg", …]` for the `escript` contract, whose entry point is `main/1`.
+fn wrap_erlang_entrypoint(
+    module: &str,
+    function: &str,
+    args_literal: &str,
+    runtime: &RuntimeSession,
+) -> String {
     format!(
-        "codetracer_erlang_runtime:start_session({options}), try apply({module}, {function}, []) of _ -> codetracer_erlang_runtime:stop_session(normal), halt(0) catch Class:Reason:Stack -> codetracer_erlang_runtime:stop_session({{Class,Reason}}), erlang:raise(Class, Reason, Stack) end.",
+        "codetracer_erlang_runtime:start_session({options}), try apply({module}, {function}, {args}) of _ -> codetracer_erlang_runtime:stop_session(normal), halt(0) catch Class:Reason:Stack -> codetracer_erlang_runtime:stop_session({{Class,Reason}}), erlang:raise(Class, Reason, Stack) end.",
         options = erlang_runtime_options(runtime),
         module = erlang_atom(module),
-        function = erlang_atom(function)
+        function = erlang_atom(function),
+        args = args_literal
     )
 }
 
@@ -4983,6 +5687,12 @@ fn elixir_charlist(value: &str) -> String {
     format!("~c\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// An Elixir binary literal (`"…"`), as opposed to [`elixir_charlist`]'s
+/// `~c"…"`. `Code.require_file/1` wants a binary path.
+fn elixir_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 fn elixir_atom(value: &str) -> String {
     if value
         .chars()
@@ -5067,13 +5777,30 @@ fn remove_root_mfa_start(args: &mut Vec<String>, root_mfa: &RootMfa) {
     }
 }
 
+/// Windows executable suffixes stripped from a launch command's file name.
+///
+/// The desktop core resolves the BEAM launchers with Nim's `findExe`
+/// (`elixirExe` / `escriptExe`, `codetracer/src/common/paths.nim`), which on
+/// Windows returns `…\elixir.bat` / `…\escript.cmd`. Without stripping, the
+/// launch target would be classified by the name `elixir.bat`, which matches
+/// nothing — so a Windows `ct record foo.ex` would fall through to the
+/// non-BEAM path and record nothing at all. Case-insensitive, and only
+/// applied when a non-empty stem remains.
+const EXECUTABLE_SUFFIXES: [&str; 3] = [".exe", ".bat", ".cmd"];
+
 fn target_program_name(target_command: &str) -> String {
-    Path::new(target_command)
+    let name = Path::new(target_command)
         .file_name()
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
-        .unwrap_or(target_command)
-        .to_string()
+        .unwrap_or(target_command);
+    let lowered = name.to_ascii_lowercase();
+    for suffix in EXECUTABLE_SUFFIXES {
+        if lowered.ends_with(suffix) && name.len() > suffix.len() {
+            return name[..name.len() - suffix.len()].to_string();
+        }
+    }
+    name.to_string()
 }
 
 fn recording_anchor_path(target_command: &str) -> PathBuf {
@@ -5457,6 +6184,14 @@ struct BundleSummary {
     /// real reader.
     event_log_records: Vec<MessageEventLogSummary>,
 
+    /// What the recorded program wrote to stdout/stderr while it ran, read
+    /// back out of the trace. This is the only way to answer "did the
+    /// recording capture the run, or merely accompany it?" from the trace
+    /// alone — a recorder that started the program and recorded nothing still
+    /// lets the program print to the terminal, which is precisely how the
+    /// `elixir` launch-target defect looked successful.
+    recorded_output: Vec<RecordedOutputSummary>,
+
     /// M7: number of `*.manifest.json` files written under
     /// `recorder_metadata/manifests/` that the recorder produced for the
     /// recorded program. The runtime session also emits a `manifest_loaded`
@@ -5510,6 +6245,13 @@ struct ExceptionFromSummary {
     function: String,
     arity: u32,
     class: String,
+}
+
+/// One line of recorded program output, as read back from the trace.
+#[derive(Serialize, Debug)]
+struct RecordedOutputSummary {
+    stream: String,
+    text: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -5910,6 +6652,7 @@ fn read_bundle_summary(
     let mut exception_from_count: u64 = 0;
     let mut exception_from_records: Vec<ExceptionFromSummary> = Vec::new();
     let mut event_log_records: Vec<MessageEventLogSummary> = Vec::new();
+    let mut recorded_output: Vec<RecordedOutputSummary> = Vec::new();
     for index in 0..reader.event_count() {
         let raw = reader.event_json(index)?;
         let event: serde_json::Value = match serde_json::from_str(&raw) {
@@ -5928,6 +6671,24 @@ fn read_bundle_summary(
         let Ok(text) = std::str::from_utf8(&bytes) else {
             continue;
         };
+
+        // Recorded program output. The metadata slot carries the stream name
+        // the recorder wrote it under (`stdout` / `stderr`); the CTFS event
+        // kind alone cannot tell them apart, because the container collapses
+        // every write kind onto one coarse `stdout` kind.
+        let stream = reader
+            .event_metadata(index)
+            .ok()
+            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+            .unwrap_or_default();
+        if stream == "stdout" || stream == "stderr" {
+            recorded_output.push(RecordedOutputSummary {
+                stream,
+                text: text.to_string(),
+            });
+            continue;
+        }
+
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(text) else {
             continue;
         };
@@ -6044,6 +6805,7 @@ fn read_bundle_summary(
         send_event_count,
         receive_event_count,
         event_log_records,
+        recorded_output,
         manifest_count,
         manifest_modules,
         manifest_loaded_records,
@@ -6073,7 +6835,107 @@ fn find_single_ct_file(bundle_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_fixture_options, parse_record_options, ParsedRecordCommand};
+    use super::{
+        detect_target_language, is_beam_target, parse_fixture_options, parse_record_options,
+        runtime_compiler_for_target, ParsedRecordCommand, RuntimeCompiler,
+    };
+
+    /// The five launch commands this recorder claims to instrument, and the
+    /// source language each one implies. `elixir` and `escript` are the two
+    /// the desktop core builds for a single-file recording
+    /// (`recorder_dispatch.nim`: `-- elixir <program>` for `.ex`/`.exs`,
+    /// `-- escript <program>` for `.erl`/`.hrl`); getting `escript` wrong
+    /// would label every single-file Erlang recording "elixir".
+    #[test]
+    fn classifies_every_beam_launch_target() {
+        for (command, language) in [
+            ("mix", "elixir"),
+            ("elixir", "elixir"),
+            ("erl", "erlang"),
+            ("rebar3", "erlang"),
+            ("escript", "erlang"),
+        ] {
+            assert!(
+                is_beam_target(command),
+                "{command} must be recognised as a BEAM launch target"
+            );
+            assert_eq!(
+                detect_target_language(command),
+                language,
+                "{command} must record {language}"
+            );
+        }
+    }
+
+    /// Absolute paths and Windows executable suffixes reach the recorder
+    /// verbatim from the core: `elixirExe` / `escriptExe`
+    /// (`codetracer/src/common/paths.nim`) are resolved with Nim's `findExe`,
+    /// which returns a full path — and on Windows one ending in `.bat` or
+    /// `.cmd`. Classifying by the raw file name would make a Windows
+    /// `ct record foo.ex` fall through to the non-BEAM path and record
+    /// nothing.
+    #[test]
+    fn classifies_beam_launch_targets_given_as_paths() {
+        for command in [
+            "/nix/store/abc-elixir-1.18.4/bin/elixir",
+            "/usr/lib/erlang/bin/escript",
+            "elixir.bat",
+            "escript.cmd",
+            "mix.exe",
+        ] {
+            assert!(
+                is_beam_target(command),
+                "{command} must be recognised as a BEAM launch target"
+            );
+        }
+        assert_eq!(
+            detect_target_language("/usr/lib/erlang/bin/escript"),
+            "erlang"
+        );
+        assert_eq!(detect_target_language("escript.cmd"), "erlang");
+
+        #[cfg(windows)]
+        {
+            assert!(is_beam_target(r"C:\Program Files\Elixir\bin\elixir.bat"));
+            assert_eq!(
+                detect_target_language(r"C:\Program Files\erl\bin\escript.exe"),
+                "erlang"
+            );
+        }
+    }
+
+    #[test]
+    fn non_beam_commands_stay_non_beam() {
+        for command in ["sh", "bash", "python3", "node", "cargo"] {
+            assert!(
+                !is_beam_target(command),
+                "{command} must not be treated as a BEAM launch target"
+            );
+        }
+    }
+
+    /// The runtime app must be compiled by the toolchain that will load it:
+    /// `elixir`/`elixirc` and `erl`/`erlc` can be pinned to different OTP
+    /// releases, and a newer `erlc`'s output will not load in an older
+    /// emulator.
+    #[test]
+    fn picks_the_runtime_compiler_matching_the_launcher() {
+        for command in ["mix", "elixir"] {
+            assert!(
+                matches!(
+                    runtime_compiler_for_target(command),
+                    RuntimeCompiler::Elixir
+                ),
+                "{command} must build the runtime app with the Elixir compiler"
+            );
+        }
+        for command in ["erl", "rebar3", "escript", "sh"] {
+            assert!(
+                matches!(runtime_compiler_for_target(command), RuntimeCompiler::Erlc),
+                "{command} must build the runtime app with erlc"
+            );
+        }
+    }
 
     #[test]
     fn parses_target_command_after_separator() {

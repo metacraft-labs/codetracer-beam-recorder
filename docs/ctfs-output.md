@@ -13,8 +13,9 @@ single tarball.
 ├── trace_meta.json            # bundle metadata + runtime session info
 ├── runtime_session.jsonl      # per-event sidecar (JSON Lines)
 ├── recorder_metadata/
-│   └── manifests/
-│       └── <Module>.manifest.json
+│   ├── manifests/
+│   │   └── <Module>.manifest.json
+│   └── low_level_events.ctfs  # low-level supplement (see below)
 ├── source_map/                # copied sources, project-relative paths
 └── files/                     # legacy alias for source_map/ (links)
 ```
@@ -34,6 +35,40 @@ single tarball.
   module ([schema](manifest-schema.md)).
 - `source_map/` (and the legacy `files/` alias) is a copy of the
   recorded sources keyed by project-relative path.
+- `recorder_metadata/low_level_events.ctfs` is a **separate** CTFS
+  container holding the low-level supplement: `DropVariables` and the raw
+  `Value` / `VariableName` records. They live outside the recording's own
+  `.ct` on purpose — see below.
+
+### Why the low-level supplement is a separate container
+
+`NimTraceWriter::drop_variables` is a documented no-op: the Nim
+multi-stream writer's C API cannot express `DropVariables`, so the
+recorder encodes those records itself, in the legacy combined
+`events.log` + `events.fmt` form.
+
+Writing that `events.log` into the recording's own `.ct` made the
+container a hybrid — a v4 multi-stream trace that also looks like a
+legacy bundle. `ct print` diverts to its legacy combined-stream reader
+for **any** container that carries an `events.log`, so it then decoded
+the supplement instead of the trace, and failed outright on the
+`HEADERV1` prefix the Rust CTFS writer and reader both use but the
+legacy reader's chunk walk does not skip:
+
+```text
+Error reading events: chunk compressed data extends beyond events.log
+```
+
+Every instrumented BEAM recording — `erl`, `rebar3`, `elixir` and
+`escript` — was therefore undecodable by the product's own decoder.
+Keeping the supplement in its own container leaves the recording a clean
+multi-stream bundle. Read it with
+`codetracer_trace_reader::ctfs_reader::read_trace_from_ctfs` against
+`recorder_metadata/low_level_events.ctfs`; the recorder's own tests do.
+
+The underlying gap — a writer capability the Nim C API does not expose —
+is upstream in `codetracer-trace-format` / `codetracer-trace-format-nim`,
+as is the legacy reader's missing `HEADERV1` skip.
 
 ## `ct print` workflow
 

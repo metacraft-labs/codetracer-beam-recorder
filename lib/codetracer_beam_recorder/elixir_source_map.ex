@@ -193,31 +193,14 @@ defmodule CodetracerBeamRecorder.ElixirSourceMap do
 
     ensure_task_ebin_on_code_path()
     runtime_ebin = compile_runtime_app!(build_dir)
-    Code.prepend_path(runtime_ebin)
-    :code.add_patha(String.to_charlist(runtime_ebin))
-
-    unless function_exported?(:codetracer_forms, :instrument_abstract_forms, 5) do
-      case :code.load_file(:codetracer_forms) do
-        {:module, :codetracer_forms} -> :ok
-        {:error, reason} -> Mix.raise("failed to load codetracer_forms from #{runtime_ebin}: #{inspect(reason)}")
-      end
-    end
+    load_forms!(runtime_ebin)
 
     trace_file = Path.join(build_dir, "compiler_traces/events.jsonl")
-    {:ok, _pid} = CodetracerBeamRecorder.CompilerTraceCollector.start_link(trace_file)
-    old_tracers = Code.get_compiler_option(:tracers)
-    old_debug_info = Code.get_compiler_option(:debug_info)
-    Code.put_compiler_option(:debug_info, true)
-    Code.put_compiler_option(:tracers, [CodetracerBeamRecorder.CompilerTracer | old_tracers])
 
-    try do
+    with_compiler_tracing(trace_file, fn ->
       Mix.Task.reenable("compile")
       Mix.Task.run("compile", ["--force"])
-    after
-      Code.put_compiler_option(:tracers, old_tracers)
-      Code.put_compiler_option(:debug_info, old_debug_info)
-      CodetracerBeamRecorder.CompilerTraceCollector.stop()
-    end
+    end)
 
     app_infos = project_apps(source_root)
     selected_apps =
@@ -243,6 +226,30 @@ defmodule CodetracerBeamRecorder.ElixirSourceMap do
       Mix.raise("codetracer module filters matched no compiled Elixir modules")
     end
 
+    summary = finalize_build(build_dir, source_root, modules, event_index, source_paths)
+
+    File.write!(Path.join(build_dir, "standalone_build.json"), JasonCompat.encode_pretty!(summary))
+
+    %{
+      build_dir: build_dir,
+      compiler_trace_file: trace_file,
+      summary: summary
+    }
+  end
+
+  @doc false
+  # Shared tail of every Elixir build: take already-compiled BEAM modules,
+  # reconstruct their Erlang abstract forms from `debug_info`, run them
+  # through the same `codetracer_forms` instrumenter the Erlang path uses,
+  # and write the recorder metadata (`standalone_build.json` shape,
+  # schema `codetracer.beam.standalone-build.v1`).
+  #
+  # `build_mix_project/1` reaches here after `mix compile`; `build_standalone/1`
+  # reaches here after compiling loose `.ex`/`.exs` files with the Elixir
+  # compiler directly.  Everything downstream of the compiler is identical,
+  # which is what makes a bare `elixir foo.ex` recording carry exactly the
+  # same manifests, source maps and step locations as a Mix recording.
+  def finalize_build(build_dir, source_root, modules, event_index, source_paths) do
     instrumented_ebin = Path.join(build_dir, "instrumented/ebin")
     locations_root = Path.join(build_dir, "recorder_metadata/step_locations")
     dumps_root = Path.join(build_dir, "recorder_metadata/transformed_forms")
@@ -287,7 +294,7 @@ defmodule CodetracerBeamRecorder.ElixirSourceMap do
             end
 
           {:error, reason} ->
-            Mix.shell().info("codetracer skipping #{module.module}: #{inspect(reason)}")
+            notify("codetracer skipping #{module.module}: #{inspect(reason)}")
             []
         end
       end)
@@ -300,7 +307,7 @@ defmodule CodetracerBeamRecorder.ElixirSourceMap do
     {source_map_artifacts, manifest_artifacts} =
       write_metadata(build_dir, source_root, source_maps, trace_functions, step_locations, variable_slots, transformed_dumps)
 
-    summary = %{
+    %{
       schema: "codetracer.beam.standalone-build.v1",
       build_dir: build_dir,
       source_root: source_root,
@@ -312,14 +319,276 @@ defmodule CodetracerBeamRecorder.ElixirSourceMap do
       trace_functions: trace_functions,
       step_locations: step_locations
     }
+  end
 
-    File.write!(Path.join(build_dir, "standalone_build.json"), JasonCompat.encode_pretty!(summary))
+  # --------------------------------------------------------------------
+  # Standalone (no Mix project) Elixir build — the `elixir <program>.ex`
+  # launch target.
+  #
+  # See docs/launch-targets.md §"elixir".  The short version: a bare
+  # `.ex` script mixes two things that a Mix project keeps apart —
+  # MODULE DEFINITIONS (which must be compiled ahead of time so
+  # `codetracer_forms` can instrument their abstract forms) and TOP-LEVEL
+  # EXPRESSIONS (which are the program's entry point and must run only
+  # once, under a started recording session).  `elixirc`-style whole-file
+  # compilation cannot separate them: compiling a file EXECUTES its
+  # top-level code, so the program would run — uninstrumented — during
+  # the build.
+  #
+  # So the split is done on the parsed AST, and each half is given to the
+  # tool that wants it:
+  #
+  #   * `defmodule` / `defprotocol` / `defimpl` forms (plus any top-level
+  #     `alias` / `import` / `require` directives they depend on) are
+  #     compiled with `Code.compile_quoted/2` and the resulting BEAM
+  #     binaries written out.  `Code.compile_quoted(ast, file)` keeps the
+  #     ORIGINAL `.ex` path and line numbers in the module's `debug_info`,
+  #     which is what makes the reconstructed Erlang forms map back onto
+  #     the user's `.ex` file exactly as they do under Mix.
+  #   * everything else is written to a generated entry script whose path
+  #     is reported back to the recorder, which runs it inside the
+  #     `start_session` / `stop_session` wrapper.
+  # --------------------------------------------------------------------
+
+  @standalone_entry_schema "codetracer.beam.standalone-elixir-entry.v1"
+
+  def build_standalone_from_spec!(spec_path) do
+    spec = spec_path |> File.read!() |> JasonCompat.decode!()
+
+    build_standalone(
+      build_dir: Map.fetch!(spec, "build_dir"),
+      source_root: Map.fetch!(spec, "source_root"),
+      sources: Map.fetch!(spec, "sources"),
+      runtime_ebin: Map.fetch!(spec, "runtime_ebin"),
+      summary_path: Map.fetch!(spec, "summary_path"),
+      include_modules: Map.get(spec, "include_modules") || [],
+      exclude_modules: Map.get(spec, "exclude_modules") || []
+    )
+  end
+
+  def build_standalone(opts) do
+    build_dir = opts |> Keyword.fetch!(:build_dir) |> Path.expand()
+    source_root = opts |> Keyword.fetch!(:source_root) |> Path.expand()
+    sources = opts |> Keyword.fetch!(:sources) |> Enum.map(&Path.expand/1)
+    runtime_ebin = opts |> Keyword.fetch!(:runtime_ebin) |> Path.expand()
+    summary_path = opts |> Keyword.fetch!(:summary_path) |> Path.expand()
+    include_modules = Keyword.get(opts, :include_modules, [])
+    exclude_modules = Keyword.get(opts, :exclude_modules, [])
+
+    if sources == [] do
+      Mix.raise("codetracer standalone Elixir build was given no .ex/.exs sources")
+    end
+
+    File.mkdir_p!(build_dir)
+    load_forms!(runtime_ebin)
+
+    unit_ebin = Path.join(build_dir, "elixir_units/ebin")
+    entry_root = Path.join(build_dir, "elixir_units/entry")
+    File.rm_rf!(unit_ebin)
+    File.mkdir_p!(unit_ebin)
+    File.mkdir_p!(entry_root)
+
+    trace_file = Path.join(build_dir, "compiler_traces/elixir_standalone_events.jsonl")
+
+    units =
+      with_compiler_tracing(trace_file, fn ->
+        Enum.map(sources, &compile_standalone_source!(&1, unit_ebin, entry_root))
+      end)
+
+    module_filter = %{include: include_modules, exclude: exclude_modules}
+
+    modules =
+      units
+      |> Enum.flat_map(fn unit ->
+        Enum.map(unit.modules, fn module ->
+          %{
+            app: "standalone",
+            app_root: source_root,
+            module: module.module,
+            beam_path: module.beam_path
+          }
+        end)
+      end)
+      |> Enum.reject(fn module -> filtered_out_module?(module.module, module_filter) end)
+
+    if modules == [] do
+      Mix.raise(
+        "codetracer standalone Elixir build produced no instrumentable modules from " <>
+          "#{Enum.join(sources, ", ")} (module filters: include=#{inspect(include_modules)} " <>
+          "exclude=#{inspect(exclude_modules)})"
+      )
+    end
+
+    event_index = trace_file |> read_compiler_events() |> compiler_event_index()
+
+    summary =
+      build_dir
+      |> finalize_build(source_root, modules, event_index, sources)
+      |> Map.put(:elixir_entries, Enum.map(units, &entry_record/1))
+
+    File.write!(summary_path, JasonCompat.encode_pretty!(summary))
+    summary
+  end
+
+  defp entry_record(unit) do
+    %{
+      schema: @standalone_entry_schema,
+      source_path: unit.source_path,
+      entry_path: unit.entry_path,
+      expression: unit.expression,
+      modules: Enum.map(unit.modules, & &1.module)
+    }
+  end
+
+  defp compile_standalone_source!(path, unit_ebin, entry_root) do
+    quoted =
+      path
+      |> File.read!()
+      |> Code.string_to_quoted!(file: path, columns: true)
+
+    forms =
+      case quoted do
+        {:__block__, _meta, list} when is_list(list) -> list
+        other -> [other]
+      end
+
+    {module_forms, entry_forms} = Enum.split_with(forms, &module_definition_form?/1)
+
+    # A `defmodule` nested inside a TOP-LEVEL EXPRESSION (`if`, `case`, `for`,
+    # `with`, ...) is not a top-level module form, so the split above leaves it
+    # in the entry script -- where it would be compiled at RECORD time, on the
+    # code path, UNINSTRUMENTED, while the recording still exited 0.  If the
+    # file also defines a module at the top level, nothing else notices: the
+    # build succeeds, the guards in docs/launch-targets.md §6 all pass (they
+    # only fire when NOTHING was instrumented), and the user gets a trace that
+    # silently describes half their program.  That is precisely the
+    # silent-incompleteness pattern codetracer-specs/CLI/ct/record.md forbids
+    # and this launch target exists to eliminate, so refuse it by name.
+    case nested_module_definitions(entry_forms) do
+      [] ->
+        :ok
+
+      nested ->
+        Mix.raise(
+          "codetracer cannot instrument #{path}: it defines #{Enum.join(nested, ", ")} inside a " <>
+            "top-level expression. The `elixir <program>.ex` target compiles module definitions " <>
+            "ahead of the recording so their abstract forms can be instrumented, and only forms " <>
+            "at the TOP LEVEL of the file can be compiled that way; a module defined inside " <>
+            "`if`/`case`/`for` would be built while the program runs and recorded " <>
+            "UNINSTRUMENTED. Move the module to the top level of the file, or record the " <>
+            "enclosing project with `-- mix run -e <expression>`."
+        )
+    end
+
+    directive_forms = Enum.filter(entry_forms, &directive_form?/1)
+
+    compiled =
+      case directive_forms ++ module_forms do
+        [] -> []
+        to_compile -> Code.compile_quoted({:__block__, [], to_compile}, path)
+      end
+
+    modules =
+      Enum.map(compiled, fn {module, binary} ->
+        beam_path = Path.join(unit_ebin, "#{module}.beam")
+        File.write!(beam_path, binary)
+        %{module: Atom.to_string(module), beam_path: beam_path}
+      end)
+
+    expression = entry_forms |> Enum.map(&Macro.to_string/1) |> Enum.join("\n")
+    entry_path = Path.join(entry_root, "#{safe_filename(Path.basename(path))}.entry.exs")
+
+    File.write!(entry_path, [
+      "# codetracer generated entry script for ",
+      path,
+      "\n# Top-level expressions of the recorded `.ex` program, with its module\n",
+      "# definitions removed (they are compiled and instrumented ahead of time).\n",
+      expression,
+      "\n"
+    ])
 
     %{
-      build_dir: build_dir,
-      compiler_trace_file: trace_file,
-      summary: summary
+      source_path: path,
+      entry_path: entry_path,
+      expression: expression,
+      modules: modules
     }
+  end
+
+  # Module definitions reachable from `forms` but not AT the top level of the
+  # file -- the ones `Enum.split_with(&module_definition_form?/1)` cannot see.
+  #
+  # `quote` blocks are pruned: a `defmodule` inside a quoted expression is a
+  # TEMPLATE for a module, not a definition, and refusing those would reject
+  # valid metaprogramming that the split already handles correctly.
+  defp nested_module_definitions(forms) do
+    forms
+    |> Macro.prewalk([], fn
+      {:quote, _, _}, acc ->
+        {{:__block__, [], []}, acc}
+
+      {definer, _, [name | _]} = node, acc
+      when definer in [:defmodule, :defprotocol, :defimpl] ->
+        {node, ["#{definer} #{Macro.to_string(name)}" | acc]}
+
+      node, acc ->
+        {node, acc}
+    end)
+    |> elem(1)
+    |> Enum.reverse()
+  end
+
+  defp module_definition_form?({:defmodule, _, _}), do: true
+  defp module_definition_form?({:defprotocol, _, _}), do: true
+  defp module_definition_form?({:defimpl, _, _}), do: true
+  defp module_definition_form?(_), do: false
+
+  defp directive_form?({directive, _, _}) when directive in [:alias, :import, :require], do: true
+  defp directive_form?(_), do: false
+
+  defp load_forms!(runtime_ebin) do
+    Code.prepend_path(runtime_ebin)
+    :code.add_patha(String.to_charlist(runtime_ebin))
+
+    unless function_exported?(:codetracer_forms, :instrument_abstract_forms, 5) do
+      case :code.load_file(:codetracer_forms) do
+        {:module, :codetracer_forms} ->
+          :ok
+
+        {:error, reason} ->
+          Mix.raise("failed to load codetracer_forms from #{runtime_ebin}: #{inspect(reason)}")
+      end
+    end
+
+    :ok
+  end
+
+  defp with_compiler_tracing(trace_file, fun) do
+    {:ok, _pid} = CodetracerBeamRecorder.CompilerTraceCollector.start_link(trace_file)
+    old_tracers = Code.get_compiler_option(:tracers)
+    old_debug_info = Code.get_compiler_option(:debug_info)
+    Code.put_compiler_option(:debug_info, true)
+    Code.put_compiler_option(:tracers, [CodetracerBeamRecorder.CompilerTracer | old_tracers])
+
+    try do
+      fun.()
+    after
+      Code.put_compiler_option(:tracers, old_tracers)
+      Code.put_compiler_option(:debug_info, old_debug_info)
+      CodetracerBeamRecorder.CompilerTraceCollector.stop()
+    end
+  end
+
+  # `Mix.shell()` needs the `:mix` application's state process, which a bare
+  # `elixir` run (the standalone build) does not have.  `Mix.raise/1` is a
+  # plain function and works either way, so only the informational path
+  # needs the fallback.
+  defp notify(message) do
+    Mix.shell().info(message)
+  rescue
+    _ -> IO.puts(message)
+  catch
+    _, _ -> IO.puts(message)
   end
 
   defp compile_runtime_app!(build_dir) do

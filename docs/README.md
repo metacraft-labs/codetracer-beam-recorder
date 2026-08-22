@@ -13,6 +13,10 @@ extension, the DAP bridge) can consume a recorder-produced bundle.
   project.
 - [`cli.md`](cli.md) — the standalone `codetracer-beam-recorder`
   command-line interface.
+- [`launch-targets.md`](launch-targets.md) — the launch commands `record`
+  accepts (`mix`, `erl`, `rebar3`, `elixir`, `escript`), what each implies
+  about the program's language and `--source-dir`, how the runtime is
+  injected into each, and the guard against silent empty recordings.
 - [`source-maps.md`](source-maps.md) — sparse source-map artifacts and
   how the recorder copies sources into the bundle.
 - [`web-request-spans.md`](web-request-spans.md) — recording one span per

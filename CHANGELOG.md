@@ -10,6 +10,21 @@ Versions are SemVer; the canonical version lives in `Cargo.toml`.
 
 ### Added
 
+- `elixir` and `escript` launch targets. `record -- elixir <program>.ex`
+  and `record -- escript <program>.erl` are now instrumented and
+  recorded, which is what `ct record foo.ex` / `ct record foo.erl`
+  dispatch through the CodeTracer desktop core. A bare `.ex` program is
+  compiled outside Mix by splitting its module definitions from its
+  top-level entry code and instrumenting the former through the same
+  `codetracer_forms` abstract-forms transform `mix compile.codetracer`
+  uses. Specified in `docs/launch-targets.md`.
+- Recorded program output. The recorder now forwards the target's
+  stdout and stderr byte for byte AND writes a copy into the trace, so
+  "what did this run print?" is answerable from the trace alone.
+  `read-bundle-summary` surfaces it as `recorded_output`. The copy in
+  the trace is one event per line and lossy-UTF-8 decoded, so it is not
+  a faithful transcript of binary output — see
+  `docs/known-limitations.md`.
 - RS-M8: web-request spans. `CodetracerBeamRecorder.Plug` records one
   span per HTTP request directly into the recording's `.ct` container —
   no sidecar file — with the owning BEAM process id in metadata.
@@ -25,6 +40,32 @@ Versions are SemVer; the canonical version lives in `Cargo.toml`.
   `tests/integration/phoenix_requests_test.exs`, plus
   `just demo-request-panel-elixir` and
   `just record-request-panel-fixture`.
+
+### Fixed
+
+- Recorded `.ct` files are decodable by `ct print` again. The low-level
+  supplement (`DropVariables` and the raw `Value` records, which the Nim
+  multi-stream writer's C API cannot express) was appended into the
+  recording's own container as a legacy combined `events.log`; `ct print`
+  diverts to its legacy reader for any container carrying one, and then
+  failed with `chunk compressed data extends beyond events.log`. Every
+  instrumented BEAM recording — `erl` and `rebar3` included — was
+  affected. The supplement now lives in
+  `recorder_metadata/low_level_events.ctfs`. See `docs/ctfs-output.md`.
+- A BEAM launch target can no longer produce a successful-looking empty
+  recording. `record -- elixir foo.ex` used to exit 0 with a
+  `"mode": "non_beam"` trace containing 2 events, 0 functions and 0
+  calls, while the program itself ran and printed normally. Every way of
+  reaching an uninstrumented BEAM recording now exits non-zero with a
+  diagnostic naming the cause — see `docs/launch-targets.md` §6.
+- A `.ex` program that defines a module inside a top-level expression
+  (`if … do defmodule … end end`, a comprehension, a `case` arm) is
+  refused instead of being partially recorded. Such a module is not a
+  top-level form, so it would have been compiled while the program ran
+  and recorded uninstrumented; when the file also defined a module at
+  the top level, every "nothing was instrumented" guard still passed and
+  the recording silently described half the program. `quote` blocks are
+  exempt.
 
 ### Notes
 

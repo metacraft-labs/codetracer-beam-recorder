@@ -2,78 +2,83 @@
 # Launcher <-> recorder compatibility contract for codetracer-beam-recorder.
 #
 # ###########################################################################
-# ## READ THIS FIRST: THIS EDGE IS BLOCKED AND IS NOT WIRED INTO ANY GATE.  ##
+# ## STATUS: GREEN LOCALLY, NOT YET WIRED INTO ANY GATE.                    ##
 # ###########################################################################
 #
-#   Running the edge today FAILS, and it fails for a real reason.  This file
-#   is the contract that made that reason visible, and it is checked in for
-#   exactly that purpose; it is deliberately NOT referenced by any CI workflow
-#   (there is no `launcher-recorder-e2e.yml` caller in this repo, and no `beam`
-#   row in the launcher or desktop fan-out matrices) until the defect below is
-#   fixed.  See milestone LRC-4 in
+#   `bash ci/test/launcher-recorder-e2e.sh codetracer-beam-recorder beam`
+#   reports `scenarios: 4  assertions: 40  passed: 40  failed: 0` / `PASS`
+#   (Linux x86_64, NixOS via the `eli-wsl` distro), decoding ~360 events (361
+#   and 362 on two consecutive runs -- the BEAM's own code-server traffic makes
+#   the exact count vary slightly, which is why the fixture declares a FLOOR)
+#   and finding the hop-1 proof line
+#   `launcher-recorder-e2e: component-dir=<staged bundle>` inside the trace.
+#   It is still deliberately NOT referenced by any CI workflow -- there is no
+#   `launcher-recorder-e2e.yml` caller in this repo and no `beam` row in the
+#   launcher or desktop fan-out matrices -- because wiring it is a separate,
+#   explicitly sequenced step.  See milestone LRC-4 in
 #   codetracer-specs/Testing/Launcher-Recorder-Compatibility-Tests.milestones.org.
 #
-#   WHAT `ct record <program>.ex` DOES TODAY.  It exits 0, prints a
-#   `recordingId:`, and writes an `elixir.ct` containing 2 events, 0 functions
-#   and 0 calls -- none of the recorded program's own output or code.  `ct`
-#   reports a successful recording that recorded nothing.  Observed with
-#   `bash ci/test/launcher-recorder-e2e.sh codetracer-beam-recorder beam`:
-#   `scenarios: 4  assertions: 40  passed: 32  failed: 8`, the eight failures
-#   being `decoded only 2 events`, `the decoded trace reports a zero count`,
-#   the three expected functions, both recorded-stdout lines, and
-#   `'--source-dir' was not honoured`.
+#   NOTHING IN THIS FILE WAS WEAKENED TO GET THERE.  `min-events`, the three
+#   expected functions, both recorded-stdout lines and the `--source-dir`
+#   declaration are exactly as they were written while the edge was red.  Keep
+#   it that way: lowering any of them would convert a true red into the vacuous
+#   pass this whole gate exists to prevent.
 #
-#   WHY.  The desktop core and this recorder disagree about the LAUNCH COMMAND,
-#   and neither side ever found out because nothing exercised the pair:
+# ---------------------------------------------------------------------------
+# WHAT THIS EDGE USED TO DO, AND WHAT FIXED IT (kept because the failure mode
+# is the whole reason the gate exists)
+#
+#   `ct record <program>.ex` used to exit 0, print a `recordingId:`, and write
+#   an `elixir.ct` containing 2 events, 0 functions and 0 calls -- none of the
+#   recorded program's own output or code.  The program still ran and still
+#   printed to the terminal, so on screen it looked entirely successful.
+#   `trace_meta.json` said it outright: `"mode": "non_beam"`,
+#   `"injection_decision": "runtime not injected for non-BEAM target"`,
+#   `"sources": []`.  The edge reported `passed: 32  failed: 8`.
+#
+#   WHY.  The desktop core and this recorder disagreed about the LAUNCH
+#   COMMAND, and neither side ever found out because nothing exercised the
+#   pair:
 #
 #     * codetracer/src/ct/trace/recorder_dispatch.nim builds, for `LangElixir`,
 #         codetracer-beam-recorder record --out-dir D --source-dir S
 #             -- elixir <program>
 #       and for `LangErlang` the same with `-- escript <program>`.
-#     * this recorder's `is_beam_target()` (src/main.rs) matches only
+#     * this recorder's `is_beam_target()` (src/main.rs) matched only
 #         "mix" | "erl" | "rebar3"
-#       so `elixir` is classified NON-BEAM: no runtime injection, no
+#       so `elixir` was classified NON-BEAM: no runtime injection, no
 #       instrumentation, no source bundling -- and, critically, no error.
 #
-#   IT IS NOT A ONE-LINE FIX, and this milestone deliberately did not attempt
-#   one.  Teaching `is_beam_target()` about `elixir`/`escript` (verified by
-#   experiment on a scratch build, then reverted) only moves the failure:
-#     * `-- elixir <file>.ex` then fails `compile_failure: no Erlang sources
-#       were compiled into instrumented ebin` -- Elixir instrumentation lives
-#       in the Mix compiler task `compile.codetracer`, not in the standalone
-#       build path `--source-dir` uses;
-#     * `-- escript <file>.erl` gets FURTHER (the sources really are
-#       instrumented and bundled into `<out-dir>/files/`) and then fails
-#       `runtime_bootstrap_failed: unsupported BEAM target for M4 runtime
-#       injection: escript` -- `prepare_target()` implements
-#       `prepare_mix_target` / `prepare_erl_target` / `prepare_rebar3_target`
-#       and nothing else.
+#   THE DECISION TAKEN was option (a): this recorder gains `elixir` and
+#   `escript` launch targets, and `ct record foo.ex` keeps meaning "record this
+#   one file".  (Option (b) -- the core driving `mix`/`rebar3` against the
+#   enclosing project -- needs the folder-recording route, which is itself
+#   blocked on the launcher's dot-less-argument gap.)  It was not a one-line
+#   fix; the specification of what was built is
+#   codetracer-beam-recorder/docs/launch-targets.md.  In outline:
 #
-#   SO SOMEBODY HAS TO DECIDE, and write it down in
-#   codetracer-specs/Recorder-CLI-Conventions.md and CodeTracer-Launcher.md,
-#   which of these is the contract:
-#     (a) this recorder gains `elixir` / `escript` launch targets (a real
-#         feature: code-path injection plus Elixir standalone instrumentation),
-#         and `ct record foo.ex` keeps meaning "record this one file"; or
-#     (b) the desktop core stops pretending a single `.ex`/`.erl` file is
-#         recordable and drives `mix` / `rebar3` against the enclosing project
-#         instead -- which needs the folder-recording route that is ITSELF
-#         blocked on the launcher's dot-less-argument gap (the native edge's
-#         blocker), so the two decisions are related.
-#   Until then the honest state of `record .ex .exs .erl .hrl` in
-#   codetracer/resources/codetracer-desktop-capabilities is "the launcher routes
-#   it and the core dispatches it, but the recorder cannot execute it" -- which
-#   the capability-file test (LRC-1) cannot see, because it checks that a
-#   dispatch branch EXISTS, not that the recorder on the other end accepts what
-#   the branch sends.
-#
-#   Everything below is written for the day that is fixed, and is correct as a
-#   statement of intent: the routing half already works end to end (the launcher
-#   routes `.ex`, the core dispatches the BEAM recorder, the recorder is found
-#   and answers `--version`), and 32 of the 40 assertions pass.  Do not "fix"
-#   the fixture by lowering `min-events`, dropping the expected functions or
-#   removing `--source-dir`: that would convert a true red into the vacuous
-#   pass this whole gate exists to prevent.
+#     * `-- elixir <file>.ex` needed instrumented compilation for a bare `.ex`
+#       OUTSIDE a Mix project: Elixir instrumentation lives in the Mix compiler
+#       task `compile.codetracer`, and a loose script has no Mix project to run
+#       it in.  The recorder now splits the file's AST -- module definitions
+#       are compiled with `Code.compile_quoted/2` and instrumented through the
+#       same `codetracer_forms` abstract-forms transform Mix uses; the
+#       remaining top-level expressions become the recorded entry point.
+#     * `-- escript <file>.erl` needed real M4 injection: `escript` cannot take
+#       `-pa`, so the prepared target runs the instrumented `Module:main/1`
+#       under `erl -noshell` with the runtime and instrumented ebins on the
+#       code path.
+#     * Every path to an uninstrumented BEAM recording now fails NON-ZERO with
+#       a named diagnostic (docs/launch-targets.md §6), so this edge can never
+#       again be red for the reason "the recorder succeeded at doing nothing".
+#     * Two further defects had to be fixed for the assertions above to be
+#       reachable at all, both of which affected the pre-existing `erl` and
+#       `rebar3` targets equally: the recorder recorded none of the program's
+#       stdout (so `stdout-contains` was unsatisfiable), and it appended a
+#       legacy combined `events.log` into the recording's own container, which
+#       made `ct-print` read the whole trace as a legacy bundle and fail with
+#       `chunk compressed data extends beyond events.log`.  See
+#       docs/ctfs-output.md.
 #
 # WHAT THIS FILE IS
 #   The checked-in contract between this recorder and the `ct` launcher, read

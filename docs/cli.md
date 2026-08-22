@@ -20,6 +20,14 @@ codetracer-beam-recorder --help
 The most common invocation is `record`, which wraps a real BEAM
 target. Anything after `--` is the launch command line.
 
+The launch commands the recorder instruments are `mix`, `erl`,
+`rebar3`, `elixir` and `escript`. Which language each implies, how
+`--source-dir` is used for each, what runtime injection each performs,
+and what happens to a command outside that list are specified in
+[`launch-targets.md`](launch-targets.md). A BEAM launch command the
+recorder cannot instrument is a hard error, never a silent
+uninstrumented run.
+
 ## `record`
 
 ```text

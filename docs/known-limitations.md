@@ -7,6 +7,79 @@ here is a silent regression. The follow-up work for each item is
 tracked in [BEAM-Materialized-Trace-Recorder.milestones.org](
 ../../codetracer-specs/Planned-Work/BEAM-Materialized-Trace-Recorder.milestones.org).
 
+## Single-file `elixir` recordings: module bodies run at build time
+
+The `elixir <program>.ex` launch target compiles the program's module
+definitions ahead of the recording so their abstract forms can be
+instrumented, and runs only the file's top-level expressions inside the
+recorded session. Consequences, in full:
+
+- A module BODY (module attributes, `use` macros, anything evaluated
+  while the module is being defined) runs during the build, not during
+  the recording, and so does not appear in the trace. This is the same
+  deviation Mix has.
+- `__DIR__` and `__ENV__.file` inside *top-level* code refer to the
+  generated entry script rather than to the original `.ex` file. Code
+  inside modules is unaffected.
+- An escript archive or a shebang script (anything the `escript` target
+  is handed that is not a `.erl` source) is refused with a diagnostic
+  rather than recorded uninstrumented.
+- The recorder's copy of the program's stdout/stderr is appended to the
+  trace after the runtime's own events rather than interleaved with
+  them; the recorder shares no clock with the in-VM tracer.
+- The recorded copy of that output is **normalised, not byte-exact**.
+  Forwarding to the terminal is byte-for-byte, but the copy written into
+  the trace is one event per line, decoded with `from_utf8_lossy`: a
+  trailing `\r` is dropped from CRLF output and non-UTF-8 bytes become
+  U+FFFD. Only the terminal sees a faithful byte stream.
+
+Rationale, alternatives considered, and the exact split rules are in
+[`launch-targets.md`](launch-targets.md).
+
+## `escript` target: semantics not reproduced
+
+`escript <program>.erl` is recorded by switching the launcher to
+`erl -noshell -pa … -eval 'apply(Module, main, [Args])'` — `escript`
+cannot be given a code path, so the instrumented ebin could not otherwise
+be put in front of the script's own compilation
+([`launch-targets.md` §3](launch-targets.md)). The entry-point contract
+itself is faithful: `main/1` receives the same list of argument strings,
+stdin passes through, and a value returned from `main/1` is ignored
+exactly as `escript` ignores it. These *surrounding* behaviours belong to
+the `escript` wrapper rather than to the emulator and are **not**
+reproduced:
+
+- **`halt/1` exit codes are lost.** A program whose `main/1` calls
+  `halt(3)` exits 3 under `escript`. Under the recorder the emulator
+  halts before the wrapper can stop the recording session, so the
+  recorder reports `trace_write_failure`, exits **1**, and writes **no
+  trace at all**. `halt/1` is the only way an escript can set its own
+  exit code, so any script that uses it currently cannot be recorded.
+- **The uncaught-exception exit code differs.** `escript` exits 127 with
+  a one-line `escript: exception error: …` diagnostic. The recorder
+  re-raises inside `erl -eval`, which exits **1**, prints the whole
+  `-eval` expression to stderr, and leaves an `erl_crash.dump` in the
+  working directory. The trace itself is written.
+- **The script's own `%%!` emulator-flags line is ignored.** `escript`
+  reads flags such as `-sname` from it; the recorder runs a fixed
+  `erl -noshell` command line and never consults it. A script that
+  depends on those flags (distribution, a named node, a custom heap
+  setting) will behave differently.
+- **`init:get_plain_arguments/0` omits the script path.** `escript`
+  reports `["./prog.erl", "arg1", …]`; the recorder passes the arguments
+  through `erl -extra` and so reports `["arg1", …]` without the leading
+  script path.
+
+## Windows: the BEAM launch targets are unverified
+
+`target_program_name()` strips `.exe` / `.bat` / `.cmd` so that the
+desktop core's `findExe`-resolved launchers (`elixir.bat`,
+`escript.cmd`) are still classified as BEAM targets. That stripping is
+covered by unit tests, but **no end-to-end `elixir` or `escript`
+recording has ever been run on Windows** — there is no Windows BEAM
+toolchain in this project's environments. Treat Windows support for
+these two targets as untested rather than working.
+
 ## M16: optimized native tracer is a gen_server, not a real `erl_tracer` NIF
 
 The M16 native backend (`--tracer-backend native`) ships as an Erlang

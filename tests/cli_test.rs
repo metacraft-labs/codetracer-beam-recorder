@@ -1379,15 +1379,29 @@ fn varname_record_slices<'a>(dat: &'a [u8], offsets: &[u8]) -> Vec<&'a [u8]> {
         .collect()
 }
 
+/// Bundle-relative path of the recorder's low-level event supplement.
+///
+/// `DropVariables` and the raw `Value`/`VariableName` records live here rather
+/// than inside the recording's own `.ct`, because the Nim multi-stream writer
+/// cannot express them and the legacy combined `events.log` that carries them
+/// makes `ct-print` read the whole container as a legacy bundle — and then
+/// fail on its `HEADERV1` prefix. See `write_ctfs_runtime_events` in
+/// `src/main.rs`. The assertions below are unchanged; only the container they
+/// are read from moved.
+const LOW_LEVEL_EVENTS_SUPPLEMENT: &str = "recorder_metadata/low_level_events.ctfs";
+
+fn raw_ctfs_low_level_events(out_dir: &Path, trace_file: &str) -> Vec<TraceLowLevelEvent> {
+    let ct_path = out_dir.join(LOW_LEVEL_EVENTS_SUPPLEMENT);
+    codetracer_trace_reader::ctfs_reader::read_trace_from_ctfs(&ct_path).unwrap_or_else(|error| {
+        panic!(
+            "read raw CTFS low-level events from {} (supplement for {trace_file}): {error}",
+            ct_path.display()
+        )
+    })
+}
+
 fn raw_ctfs_drop_variable_names(out_dir: &Path, trace_file: &str) -> Vec<Vec<String>> {
-    let ct_path = out_dir.join(trace_file);
-    let events = codetracer_trace_reader::ctfs_reader::read_trace_from_ctfs(&ct_path)
-        .unwrap_or_else(|error| {
-            panic!(
-                "read raw CTFS low-level events from {}: {error}",
-                ct_path.display()
-            )
-        });
+    let events = raw_ctfs_low_level_events(out_dir, trace_file);
     let mut varnames = Vec::new();
     let mut drops = Vec::new();
     for event in events {
@@ -1415,14 +1429,7 @@ fn raw_ctfs_drop_variable_names(out_dir: &Path, trace_file: &str) -> Vec<Vec<Str
 }
 
 fn raw_ctfs_low_level_values(out_dir: &Path, trace_file: &str) -> Vec<(String, ValueRecord)> {
-    let ct_path = out_dir.join(trace_file);
-    let events = codetracer_trace_reader::ctfs_reader::read_trace_from_ctfs(&ct_path)
-        .unwrap_or_else(|error| {
-            panic!(
-                "read raw CTFS low-level events from {}: {error}",
-                ct_path.display()
-            )
-        });
+    let events = raw_ctfs_low_level_events(out_dir, trace_file);
     let mut varnames = Vec::new();
     let mut values = Vec::new();
     for event in events {
@@ -1444,14 +1451,7 @@ fn raw_ctfs_low_level_values(out_dir: &Path, trace_file: &str) -> Vec<(String, V
 }
 
 fn raw_ctfs_low_level_types(out_dir: &Path, trace_file: &str) -> Vec<TypeRecord> {
-    let ct_path = out_dir.join(trace_file);
-    let events = codetracer_trace_reader::ctfs_reader::read_trace_from_ctfs(&ct_path)
-        .unwrap_or_else(|error| {
-            panic!(
-                "read raw CTFS low-level events from {}: {error}",
-                ct_path.display()
-            )
-        });
+    let events = raw_ctfs_low_level_events(out_dir, trace_file);
     events
         .into_iter()
         .filter_map(|event| match event {
@@ -4320,6 +4320,68 @@ fn e2e_clause_entry_bindings_match_golden() {
     let raw_drops = raw_ctfs_drop_variable_names(&recorded.out_dir, "erl.ct");
     assert_raw_ctfs_drop(&raw_drops, "FinalResult");
     assert_raw_ctfs_drop(&raw_drops, "Result");
+}
+
+/// The recording's own `.ct` must stay a pure multi-stream container.
+///
+/// `ct-print` — the canonical decoder, and the launcher↔recorder gate's trace
+/// oracle — diverts to its LEGACY combined-stream reader for any container
+/// that carries an `events.log`
+/// (codetracer-trace-format-nim/src/codetracer_ct_print.nim). The recorder
+/// used to append the low-level supplement (`DropVariables` and the raw
+/// `Value` records, which the Nim writer's C API cannot express) into the
+/// trace itself, which made every instrumented BEAM recording a hybrid the
+/// legacy reader then refused outright:
+///
+///     Error reading events: chunk compressed data extends beyond events.log
+///
+/// — because that reader's chunk walk does not skip the `HEADERV1` prefix the
+/// Rust CTFS writer and reader both require. The supplement therefore lives in
+/// its own container. This test is the guard: it asserts the split, not merely
+/// that a trace exists, so the hybrid cannot come back.
+#[test]
+fn e2e_recording_ct_carries_no_legacy_events_log() {
+    let recorded = record_erlang_canonical_function("ctfs-no-events-log", "main");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+
+    let trace_path = recorded.out_dir.join("erl.ct");
+    let reader = codetracer_ctfs::CtfsReader::open(&trace_path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", trace_path.display()));
+    let files = reader.list_files();
+    for legacy in ["events.log", "events.fmt"] {
+        assert!(
+            !files.iter().any(|name| name == legacy),
+            "the recording's own container must not carry the legacy '{legacy}': \
+             ct-print would read the whole trace as a legacy bundle. Files: {files:?}"
+        );
+    }
+    // …and the split streams that make it readable really are there.
+    for stream in ["calls.dat", "steps.dat", "events.dat", "meta.dat"] {
+        assert!(
+            files.iter().any(|name| name == stream),
+            "the recording's container must carry the multi-stream '{stream}': {files:?}"
+        );
+    }
+
+    // The supplement is not lost — it moved.
+    let supplement = recorded.out_dir.join(LOW_LEVEL_EVENTS_SUPPLEMENT);
+    assert!(
+        supplement.is_file(),
+        "the low-level supplement must be written to {}",
+        supplement.display()
+    );
+    let supplement_reader = codetracer_ctfs::CtfsReader::open(&supplement)
+        .unwrap_or_else(|error| panic!("open {}: {error}", supplement.display()));
+    let supplement_files = supplement_reader.list_files();
+    assert!(
+        supplement_files.iter().any(|name| name == "events.log"),
+        "the supplement must carry the legacy combined stream: {supplement_files:?}"
+    );
 }
 
 #[test]
