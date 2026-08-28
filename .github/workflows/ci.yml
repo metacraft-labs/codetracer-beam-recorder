@@ -40,7 +40,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@main
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@dev
         with:
           path: logs/
           prefix: test-logs/${{ github.run_id }}
@@ -76,7 +76,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@main
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@dev
         with:
           path: logs/
           prefix: lint-logs/${{ github.run_id }}
@@ -114,7 +114,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@main
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@dev
         with:
           path: logs/
           prefix: nix-build-logs/${{ github.run_id }}
@@ -151,7 +151,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@main
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@dev
         with:
           path: logs/
           prefix: release-check-logs/${{ github.run_id }}
