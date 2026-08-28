@@ -16,7 +16,19 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
       - name: Run tests
-        run: nix develop --command bash -c 'mkdir -p logs && just test 2>&1 | tee logs/test.log'
+        # The pipe used to live inside `bash -c '...'`. A bare `bash -c` has
+        # neither errexit nor pipefail, so `just test | tee` took tee's exit
+        # status, `bash -c` exited 0, `nix develop` propagated that 0, and a
+        # failing suite was reported as a passing job. `shell: bash` alone does
+        # NOT fix that -- the masking pipe is one shell deeper. Lift the pipe
+        # into the step shell, which `shell: bash` runs with
+        # `--noprofile --norc -eo pipefail`.
+        # `mkdir` also moves out of the nix shell, so `logs/` exists for the
+        # upload step even when `nix develop` itself fails.
+        shell: bash
+        run: |
+          mkdir -p logs
+          nix develop --command just test 2>&1 | tee logs/test.log
       - name: Upload full logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -48,7 +60,11 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
       - name: Run lint
-        run: nix develop --command bash -c 'mkdir -p logs && just lint 2>&1 | tee logs/lint.log'
+        # See the note on `Run tests`: the masking pipe was inside `bash -c`.
+        shell: bash
+        run: |
+          mkdir -p logs
+          nix develop --command just lint 2>&1 | tee logs/lint.log
       - name: Upload full logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -80,7 +96,13 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
       - name: Build default package
-        run: mkdir -p logs && nix build .#default --print-build-logs 2>&1 | tee logs/nix-build.log
+        # Here the pipe is at the step level, so `shell: bash` is enough: it
+        # selects `bash --noprofile --norc -eo pipefail` instead of the default
+        # `bash -e` (errexit, but NO pipefail).
+        shell: bash
+        run: |
+          mkdir -p logs
+          nix build .#default --print-build-logs 2>&1 | tee logs/nix-build.log
       - name: Upload full logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -113,7 +135,11 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
       - name: Run release-check
-        run: nix develop --command bash -c 'mkdir -p logs && just release-check 2>&1 | tee logs/release-check.log'
+        # See the note on `Run tests`: the masking pipe was inside `bash -c`.
+        shell: bash
+        run: |
+          mkdir -p logs
+          nix develop --command just release-check 2>&1 | tee logs/release-check.log
       - name: Upload full logs
         if: always()
         uses: actions/upload-artifact@v4
