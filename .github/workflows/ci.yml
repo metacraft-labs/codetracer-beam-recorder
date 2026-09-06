@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # This repo's mainline is `dev` (`stable` is the reserved release
+    # branch). The filter previously named `main`, a branch this repo does
+    # not have, so no mainline push ever triggered this workflow.
+    branches: [dev, stable]
   pull_request:
 
 jobs:
