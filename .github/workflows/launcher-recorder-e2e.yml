@@ -1,0 +1,88 @@
+# =============================================================================
+# Recorder -> launcher end-to-end compatibility gate (THE RECORDER EDGE).
+#
+# THIN CALLER.  All of the work -- building the real launcher, the real
+# codetracer desktop core and THIS recorder, staging the codetracer-desktop
+# component bundle, running `ct record` through the LAUNCHER binary and decoding
+# the produced trace with `ct-print` -- lives in one reusable workflow so the
+# assertions can never drift between the trigger directions:
+#
+#   metacraft-labs/codetracer/.github/workflows/launcher-recorder-e2e.yml
+#
+# Design: codetracer-specs/Testing/Launcher-Recorder-Compatibility-Tests.md
+#         section 6 "CI wiring: three trigger edges, one reusable workflow".
+# Milestone: LRC-4 (the beam edge of the fan-out; the workflow itself is LRC-3).
+#
+# WHY THIS EDGE IN PARTICULAR.  The beam edge is the standing proof of a bug
+# this initiative caught and fixed: `ct record foo.ex` reaches this recorder as
+# `codetracer-beam-recorder record ... -- elixir <program>` (and `-- escript`
+# for `.erl`), but `is_beam_target()` once accepted only `mix`/`erl`/`rebar3`,
+# so `ct record foo.ex` exited 0 having written a 2-event, 0-function
+# "mode": "non_beam" trace -- a SILENT non-recording no `ct --version` smoke
+# test could ever notice.  The recorder gained real `elixir`/`escript` launch
+# targets (docs/launch-targets.md); this gate is what keeps that honest, in
+# both directions.
+#
+# WHAT THIS EDGE PINS.  This repository is the one under test, so it is pinned
+# to `github.sha` -- and this caller does not have to say so.  The reusable
+# workflow makes the TRIGGERING repo its primary `actions/checkout` at
+# `${{ github.sha }}`; inside a reusable workflow that context is the caller's.
+# The launcher, the desktop core, its agent-surface build-deps and
+# codetracer-trace-format-nim are cloned beside it at the revisions the
+# per-commit WORKSPACE LOCK pins for this commit, per
+# metacraft-dev-guidelines/policies/ci-shared-dev-env.md section 3.2.
+#
+# LOCK STATUS.  A lock-resolved sibling needs a workspace lock keyed by THIS
+# repo's commit.  A push to this repo without a lock published for the new tip
+# leaves this edge failing in `Setup dev env` with "No workspace lock for
+# codetracer-beam-recorder" (one push of grace on `push` via
+# `github.event.before`, none on a `pull_request` once the base moves).  The
+# remedy is NOT in this repository: `repro workspace lock
+# --trigger-repo=codetracer-beam-recorder` + a push to
+# metacraft-labs/metacraft-manifests, from a workspace whose `.repro/manifests`
+# is a real git checkout AND whose nim-agents / nim-acp are current (a lock
+# generated from stale agent-surface checkouts pins a nim-agents that predates
+# `loadSession`, and codetracer's sibling-override build then fails).  Do NOT
+# paper over a missing lock with a `<name>=<ref>` sibling override.
+#
+# WHAT IT ASSERTS ABOUT THIS REPO.  Everything comes from this repo's own
+# checked-in contract fixture, `cross-repo/launcher-compat.yml`: the sample
+# program, the `record .ex` route, the recorder flags the desktop core passes
+# (`--out-dir` / `--source-dir`), and the expected decoded-trace shape.  If this
+# recorder changes its CLI, its launch-target detection, its output layout or
+# its `--version` banner, that file has to change in the SAME commit -- the
+# driver refuses to run against a fixture that disagrees with it, and rejects an
+# INCOMPLETE fixture before anything is built.
+#
+# WHY IT IS NOT `launcher-integration.yml`.  That workflow is retained as a fast
+# pre-check, but it asserts only that `ct --version` matches
+# `^ct [0-9]+\.[0-9]+` and never runs `ct record`, so it is NON-AUTHORITATIVE
+# for the record contract.  This gate is the authority.
+#
+# NO PATH FILTERS, deliberately: a change anywhere in this recorder can break
+# the record contract.
+# =============================================================================
+
+name: launcher-recorder-e2e
+
+on:
+  push:
+    branches: [main, dev, stable]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: beam
+    uses: metacraft-labs/codetracer/.github/workflows/launcher-recorder-e2e.yml@dev
+    with:
+      edge: codetracer-beam-recorder@${{ github.sha }} -> launcher
+      recorder-repo: codetracer-beam-recorder
+      recorder-lang: beam
+    # `inherit` rather than a named list: the CI Token Provider App ID is held
+    # as a repository SECRET here and as a repository VARIABLE elsewhere in the
+    # org, and the reusable workflow accepts either.
+    secrets: inherit
