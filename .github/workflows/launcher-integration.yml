@@ -21,7 +21,7 @@ on:
 
 jobs:
   hex-bundling:
-    runs-on: eph-linux-x64
+    runs-on: [self-hosted, linux, x64]
     name: hex bundling smoke-test
     steps:
       - name: Generate CI token
