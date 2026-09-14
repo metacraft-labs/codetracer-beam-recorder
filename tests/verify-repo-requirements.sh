@@ -89,7 +89,7 @@ require_executable tests/fixtures/run-erlang-canonical-flow.sh
 
 require_text .envrc '^use flake$' ".envrc uses flake"
 
-require_text flake.nix 'nixos-modules\.url = "github:metacraft-labs/nixos-modules";' "flake uses shared nixos-modules input"
+require_text flake.nix 'nixos-modules\.url = "github:metacraft-labs/devops-modules";' "flake uses shared nixos-modules input"
 require_text flake.nix 'nixpkgs\.follows = "nixos-modules/nixpkgs-unstable";' "flake nixpkgs follows nixos-modules/nixpkgs-unstable"
 require_text flake.nix 'flake-parts\.follows = "nixos-modules/flake-parts";' "flake-parts follows shared input"
 require_text flake.nix 'git-hooks\.follows = "nixos-modules/git-hooks-nix";' "git-hooks follows shared input"
