@@ -1379,22 +1379,20 @@ fn varname_record_slices<'a>(dat: &'a [u8], offsets: &[u8]) -> Vec<&'a [u8]> {
         .collect()
 }
 
-/// Bundle-relative path of the recorder's low-level event supplement.
+/// Read the recording's own container back as low-level events.
 ///
-/// `DropVariables` and the raw `Value`/`VariableName` records live here rather
-/// than inside the recording's own `.ct`, because the Nim multi-stream writer
-/// cannot express them and the legacy combined `events.log` that carries them
-/// makes `ct-print` read the whole container as a legacy bundle — and then
-/// fail on its `HEADERV1` prefix. See `write_ctfs_runtime_events` in
-/// `src/main.rs`. The assertions below are unchanged; only the container they
-/// are read from moved.
-const LOW_LEVEL_EVENTS_SUPPLEMENT: &str = "recorder_metadata/low_level_events.ctfs";
-
+/// `DropVariables` and the `Value`/`VariableName` records are IN the recording
+/// now. They used to be written to a separate legacy container beside it,
+/// because the Nim writer's C API could not express a scope exit and a legacy
+/// combined `events.log` inside the recording made `ct-print` decode the whole
+/// bundle as a legacy one. The writer carries them as tag-2 and tag-3
+/// value-stream events since `trace_writer_register_drop_variable{,s}` landed,
+/// so there is one container again and these assertions read it directly.
 fn raw_ctfs_low_level_events(out_dir: &Path, trace_file: &str) -> Vec<TraceLowLevelEvent> {
-    let ct_path = out_dir.join(LOW_LEVEL_EVENTS_SUPPLEMENT);
+    let ct_path = out_dir.join(trace_file);
     codetracer_trace_reader::ctfs_reader::read_trace_from_ctfs(&ct_path).unwrap_or_else(|error| {
         panic!(
-            "read raw CTFS low-level events from {} (supplement for {trace_file}): {error}",
+            "read raw CTFS low-level events from {}: {error}",
             ct_path.display()
         )
     })
@@ -4328,17 +4326,21 @@ fn e2e_clause_entry_bindings_match_golden() {
 /// oracle — diverts to its LEGACY combined-stream reader for any container
 /// that carries an `events.log`
 /// (codetracer-trace-format-nim/src/codetracer_ct_print.nim). The recorder
-/// used to append the low-level supplement (`DropVariables` and the raw
-/// `Value` records, which the Nim writer's C API cannot express) into the
-/// trace itself, which made every instrumented BEAM recording a hybrid the
-/// legacy reader then refused outright:
+/// used to hand-encode `DropVariables` and the raw `Value` records into such a
+/// stream, because the Nim writer's C API could not express a scope exit.
+/// Written into the trace itself that made every instrumented BEAM recording a
+/// hybrid the legacy reader refused outright:
 ///
 ///     Error reading events: chunk compressed data extends beyond events.log
 ///
 /// — because that reader's chunk walk does not skip the `HEADERV1` prefix the
-/// Rust CTFS writer and reader both require. The supplement therefore lives in
-/// its own container. This test is the guard: it asserts the split, not merely
-/// that a trace exists, so the hybrid cannot come back.
+/// Rust CTFS writer and reader both require. Moving it to a container of its
+/// own kept the recording readable at the cost of splitting it in two.
+///
+/// Neither is needed now: the writer carries a scope exit as a tag-3
+/// value-stream event, so the records are in the recording and no legacy
+/// stream is written anywhere. This test guards both halves — no legacy file
+/// here, and the records that used to justify one are present.
 #[test]
 fn e2e_recording_ct_carries_no_legacy_events_log() {
     let recorded = record_erlang_canonical_function("ctfs-no-events-log", "main");
@@ -4349,7 +4351,8 @@ fn e2e_recording_ct_carries_no_legacy_events_log() {
         output_text(&recorded.output)
     );
 
-    let trace_path = recorded.out_dir.join("erl.ct");
+    let trace_file = "erl.ct";
+    let trace_path = recorded.out_dir.join(trace_file);
     let reader = codetracer_ctfs::CtfsReader::open(&trace_path)
         .unwrap_or_else(|error| panic!("open {}: {error}", trace_path.display()));
     let files = reader.list_files();
@@ -4368,19 +4371,19 @@ fn e2e_recording_ct_carries_no_legacy_events_log() {
         );
     }
 
-    // The supplement is not lost — it moved.
-    let supplement = recorded.out_dir.join(LOW_LEVEL_EVENTS_SUPPLEMENT);
+    // The records that used to need a separate container are in this one.
+    // `values.dat` is where a tag-3 scope exit lives, so its presence is what
+    // makes the drops reachable at all.
     assert!(
-        supplement.is_file(),
-        "the low-level supplement must be written to {}",
-        supplement.display()
+        files.iter().any(|name| name == "values.dat"),
+        "the recording's container must carry 'values.dat' — the stream that holds \
+         the tag-3 DropVariables events: {files:?}"
     );
-    let supplement_reader = codetracer_ctfs::CtfsReader::open(&supplement)
-        .unwrap_or_else(|error| panic!("open {}: {error}", supplement.display()));
-    let supplement_files = supplement_reader.list_files();
+    let drops = raw_ctfs_drop_variable_names(&recorded.out_dir, trace_file);
     assert!(
-        supplement_files.iter().any(|name| name == "events.log"),
-        "the supplement must carry the legacy combined stream: {supplement_files:?}"
+        !drops.is_empty(),
+        "the recording must carry the scope exits that used to live in a separate \
+         legacy container beside it; decoded none from {trace_file}"
     );
 }
 

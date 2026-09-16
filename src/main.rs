@@ -7,11 +7,9 @@ use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus};
 
-use codetracer_ctfs::{ChunkedWriter, CompressionMethod, CtfsReader, CtfsWriter};
-use codetracer_trace_format_cbor_zstd::HEADERV1;
 use codetracer_trace_types::{
-    EventLogKind, FieldTypeRecord, FullValueRecord, FunctionId, Line, TraceLowLevelEvent, TypeId,
-    TypeKind, TypeRecord, TypeSpecificInfo, ValueRecord, VariableId,
+    EventLogKind, FieldTypeRecord, FunctionId, Line, TypeId, TypeKind, TypeSpecificInfo,
+    ValueRecord,
 };
 use codetracer_trace_writer_nim::{
     read_span_stream_json, NimTraceReaderHandle, NimTraceWriter, SpanRecord,
@@ -1190,8 +1188,6 @@ struct RecordingSession {
     options: RecordOptions,
     runtime: RuntimeSession,
     prepared_target: PreparedTarget,
-    pending_drop_variable_names: Vec<Vec<String>>,
-    pending_value_events: Vec<PendingValueEvent>,
 }
 
 impl RecordingSession {
@@ -1222,8 +1218,6 @@ impl RecordingSession {
             options: options.clone(),
             runtime,
             prepared_target,
-            pending_drop_variable_names: Vec::new(),
-            pending_value_events: Vec::new(),
         };
         session.initialize_writer()?;
         Ok(session)
@@ -1329,7 +1323,6 @@ impl RecordingSession {
         self.writer
             .close()
             .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))?;
-        self.write_ctfs_runtime_events()?;
 
         write_trace_meta_json(self, &runtime_result, target_exit_code)
             .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
@@ -1417,10 +1410,6 @@ impl RecordingSession {
                         .enumerate()
                         .map(|(index, value)| {
                             let arg_name = format!("_arg{index}");
-                            self.pending_value_events.push(PendingValueEvent {
-                                variable_name: arg_name.clone(),
-                                value: value.clone(),
-                            });
                             let trace_value = json_to_trace_value(&mut self.writer, value);
                             self.writer.arg(&arg_name, trace_value)
                         })
@@ -1479,10 +1468,6 @@ impl RecordingSession {
                     name,
                     value,
                 } => {
-                    self.pending_value_events.push(PendingValueEvent {
-                        variable_name: name.clone(),
-                        value: value.clone(),
-                    });
                     let trace_value = json_to_trace_value(&mut self.writer, value);
                     self.writer
                         .register_variable_with_full_value(name, trace_value);
@@ -1510,7 +1495,6 @@ impl RecordingSession {
                         .map(|variable| variable.name.clone())
                         .collect::<Vec<_>>();
                     self.writer.drop_variables(&names);
-                    self.pending_drop_variable_names.push(names);
                     let payload = serde_json::json!({
                         "schema": "codetracer.beam.variable-binding.v1",
                         "event": "drop_variables",
@@ -1742,253 +1726,6 @@ impl RecordingSession {
         }
 
         Ok(())
-    }
-
-    /// Write the low-level supplement — `DropVariables` and the raw
-    /// `Value`/`VariableName` records — into its own CTFS container beside
-    /// the trace.
-    ///
-    /// WHY IT IS NOT WRITTEN INTO THE TRACE ITSELF. These records exist only
-    /// here because the Nim multi-stream writer's C API cannot express them:
-    /// `NimTraceWriter::drop_variables` is a documented no-op
-    /// (codetracer-trace-format/codetracer_trace_writer_nim/src/lib.rs), so
-    /// the recorder encodes them itself in the legacy combined
-    /// `events.log` + `events.fmt` form.
-    ///
-    /// Putting that `events.log` inside the recording's own `.ct` made the
-    /// container a HYBRID: the Nim writer had produced a v4 multi-stream
-    /// container, and `ct-print` — the canonical decoder, and this project's
-    /// trace-validation oracle — diverts to its legacy combined-stream reader
-    /// for any container that has an `events.log`
-    /// (codetracer-trace-format-nim/src/codetracer_ct_print.nim, "Divert to
-    /// the legacy reader whenever a combined `events.log` is present"). That
-    /// reader then decoded the supplement instead of the trace, and failed
-    /// outright on its `HEADERV1` prefix — which the Rust CTFS writer and
-    /// reader both require and its own chunk walk does not skip:
-    ///
-    ///     Error reading events: chunk compressed data extends beyond events.log
-    ///
-    /// So EVERY instrumented BEAM recording — `erl`, `rebar3`, and now
-    /// `elixir`/`escript` — produced a `.ct` the product's own decoder
-    /// refused. Keeping the supplement in a separate container leaves the
-    /// recording a clean v4 bundle that `ct-print` reads, and loses nothing:
-    /// the supplement is still a real CTFS container, still readable with
-    /// `read_trace_from_ctfs`, and the recorder's own tests read it there.
-    ///
-    /// It is NOT named `*.ct`, because `find_single_ct_file` (and the
-    /// launcher-compat fixture's `trace-glob`) require exactly one `.ct` per
-    /// bundle.
-    fn write_ctfs_runtime_events(&self) -> Result<(), RecorderDiagnostic> {
-        if self.pending_drop_variable_names.is_empty() && self.pending_value_events.is_empty() {
-            return Ok(());
-        }
-
-        let supplement_path = self.out_dir.join(LOW_LEVEL_EVENTS_SUPPLEMENT);
-        if let Some(parent) = supplement_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                RecorderDiagnostic::writer_finalization_failed(error.to_string())
-            })?;
-        }
-        append_runtime_events_to_ctfs(
-            &supplement_path,
-            &self.pending_value_events,
-            &self.pending_drop_variable_names,
-        )
-        .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
-    }
-}
-
-/// Bundle-relative path of the low-level event supplement written by
-/// [`RecordingSession::write_ctfs_runtime_events`].
-const LOW_LEVEL_EVENTS_SUPPLEMENT: &str = "recorder_metadata/low_level_events.ctfs";
-
-/// CTFS container geometry for the supplement — the same 4 KiB block size and
-/// 31 root entries the trace-format crate's own containers use.
-const CTFS_BLOCK_SIZE: u32 = 4096;
-const CTFS_MAX_ROOT_ENTRIES: u32 = 31;
-
-fn append_runtime_events_to_ctfs(
-    trace_path: &Path,
-    pending_values: &[PendingValueEvent],
-    drop_variable_groups: &[Vec<String>],
-) -> Result<(), Box<dyn Error>> {
-    // The supplement container is created on first use. `CtfsWriter::create`
-    // is only reached when the file does not exist yet, so a second append to
-    // the same bundle still extends the container it finds.
-    if !trace_path.exists() {
-        let writer = CtfsWriter::create(trace_path, CTFS_BLOCK_SIZE, CTFS_MAX_ROOT_ENTRIES)?;
-        writer.close()?;
-    }
-
-    let mut reader = CtfsReader::open(trace_path)?;
-    let files = reader.list_files();
-    let has_events_log = files.iter().any(|name| name == "events.log");
-    let has_events_fmt = files.iter().any(|name| name == "events.fmt");
-    if has_events_log {
-        let format = reader.read_file("events.fmt")?;
-        if format.as_slice() != b"split-binary" {
-            return Err(format!(
-                "cannot append DropVariables to {}: unsupported events.fmt {:?}",
-                trace_path.display(),
-                String::from_utf8_lossy(&format)
-            )
-            .into());
-        }
-    }
-
-    let existing_events = if has_events_log {
-        codetracer_trace_reader::ctfs_reader::read_trace_from_ctfs(trace_path)?
-    } else {
-        Vec::new()
-    };
-    let mut variable_names = Vec::new();
-    for event in &existing_events {
-        match event {
-            TraceLowLevelEvent::VariableName(name) | TraceLowLevelEvent::Variable(name) => {
-                variable_names.push(name.clone());
-            }
-            _ => {}
-        }
-    }
-    let mut variable_ids = variable_names
-        .iter()
-        .enumerate()
-        .map(|(id, name)| (name.clone(), VariableId(id)))
-        .collect::<BTreeMap<_, _>>();
-    let mut type_records = Vec::new();
-    for event in &existing_events {
-        if let TraceLowLevelEvent::Type(record) = event {
-            type_records.push(record.clone());
-        }
-    }
-    let mut type_ids = type_records
-        .iter()
-        .enumerate()
-        .map(|(id, record)| (type_record_key(record), TypeId(id)))
-        .collect::<BTreeMap<_, _>>();
-
-    let mut events = Vec::new();
-    for pending in pending_values {
-        let variable_id = ensure_low_level_variable(
-            &pending.variable_name,
-            &mut variable_names,
-            &mut variable_ids,
-            &mut events,
-        );
-        let value = json_to_low_level_trace_value(
-            &pending.value,
-            &mut type_records,
-            &mut type_ids,
-            &mut events,
-        )?;
-        events.push(TraceLowLevelEvent::Value(FullValueRecord {
-            variable_id,
-            value,
-        }));
-    }
-    for group in drop_variable_groups {
-        let mut ids = Vec::new();
-        for name in group {
-            let id = ensure_low_level_variable(
-                name,
-                &mut variable_names,
-                &mut variable_ids,
-                &mut events,
-            );
-            ids.push(id);
-        }
-        if !ids.is_empty() {
-            events.push(TraceLowLevelEvent::DropVariables(ids));
-        }
-    }
-    if events.is_empty() {
-        return Ok(());
-    }
-
-    let mut encoded = Vec::new();
-    let mut event_sizes = Vec::new();
-    let mut first_geids = Vec::new();
-    let first_geid = existing_events.len() as u64;
-    for (index, event) in events.iter().enumerate() {
-        let start = encoded.len();
-        codetracer_trace_writer::split_binary::encode_event(event, &mut encoded)?;
-        event_sizes.push(encoded.len() - start);
-        first_geids.push(first_geid + index as u64);
-    }
-    let chunked = ChunkedWriter::new(CompressionMethod::Zstd, events.len()).write_chunked(
-        &encoded,
-        &event_sizes,
-        &first_geids,
-    )?;
-
-    let mut writer = CtfsWriter::open_append(trace_path)?;
-    let events_handle = if let Some(handle) = writer.find_file("events.log") {
-        handle
-    } else {
-        let handle = writer.add_file("events.log")?;
-        writer.write(handle, HEADERV1)?;
-        writer.sync_entry(handle)?;
-        handle
-    };
-    writer.write(events_handle, &chunked)?;
-    writer.sync_entry(events_handle)?;
-
-    if !has_events_fmt {
-        let format_handle = writer.add_file("events.fmt")?;
-        writer.write(format_handle, b"split-binary")?;
-        writer.sync_entry(format_handle)?;
-    }
-
-    writer.close()?;
-    Ok(())
-}
-
-fn ensure_low_level_variable(
-    name: &str,
-    variable_names: &mut Vec<String>,
-    variable_ids: &mut BTreeMap<String, VariableId>,
-    events: &mut Vec<TraceLowLevelEvent>,
-) -> VariableId {
-    if let Some(id) = variable_ids.get(name) {
-        *id
-    } else {
-        let id = VariableId(variable_names.len());
-        variable_names.push(name.to_string());
-        variable_ids.insert(name.to_string(), id);
-        events.push(TraceLowLevelEvent::VariableName(name.to_string()));
-        id
-    }
-}
-
-fn type_record_key(record: &TypeRecord) -> String {
-    format!(
-        "{:?}\x1f{}\x1f{:?}",
-        record.kind, record.lang_type, record.specific_info
-    )
-}
-
-fn ensure_low_level_type(
-    kind: TypeKind,
-    lang_type: &str,
-    specific_info: TypeSpecificInfo,
-    type_records: &mut Vec<TypeRecord>,
-    type_ids: &mut BTreeMap<String, TypeId>,
-    events: &mut Vec<TraceLowLevelEvent>,
-) -> TypeId {
-    let record = TypeRecord {
-        kind,
-        lang_type: lang_type.to_string(),
-        specific_info,
-    };
-    let key = type_record_key(&record);
-    if let Some(id) = type_ids.get(&key) {
-        *id
-    } else {
-        let id = TypeId(type_records.len());
-        type_records.push(record.clone());
-        type_ids.insert(key, id);
-        events.push(TraceLowLevelEvent::Type(record));
-        id
     }
 }
 
@@ -2375,12 +2112,6 @@ struct RuntimeDroppedVariable {
     slot: u32,
     slot_template: String,
     name: String,
-}
-
-#[derive(Clone, Debug)]
-struct PendingValueEvent {
-    variable_name: String,
-    value: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3393,24 +3124,6 @@ fn json_to_trace_value(writer: &mut NimTraceWriter, value: &serde_json::Value) -
             msg: error,
             type_id,
         }
-    })
-}
-
-fn json_to_low_level_trace_value(
-    value: &serde_json::Value,
-    type_records: &mut Vec<TypeRecord>,
-    type_ids: &mut BTreeMap<String, TypeId>,
-    events: &mut Vec<TraceLowLevelEvent>,
-) -> Result<ValueRecord, String> {
-    json_to_trace_value_with(value, &mut |kind, lang_type, specific_info| {
-        ensure_low_level_type(
-            kind,
-            lang_type,
-            specific_info,
-            type_records,
-            type_ids,
-            events,
-        )
     })
 }
 

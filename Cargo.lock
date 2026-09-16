@@ -143,7 +143,6 @@ version = "0.1.0"
 dependencies = [
  "cbor4ii",
  "codetracer_ctfs",
- "codetracer_trace_format_cbor_zstd",
  "codetracer_trace_reader",
  "codetracer_trace_types",
  "codetracer_trace_writer",
@@ -190,6 +189,7 @@ dependencies = [
  "fscommon",
  "num-traits",
  "ruzstd",
+ "serde",
  "serde_json",
  "zeekstd",
  "zstd",
@@ -232,6 +232,7 @@ dependencies = [
 name = "codetracer_trace_writer_nim"
 version = "0.1.0"
 dependencies = [
+ "cbor4ii",
  "ciborium",
  "codetracer_trace_types",
  "serde_json",
