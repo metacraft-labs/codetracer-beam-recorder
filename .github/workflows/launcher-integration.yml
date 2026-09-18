@@ -1,5 +1,26 @@
 name: launcher-integration
 
+# =============================================================================
+# SCOPE: PACKAGING ONLY -- NON-AUTHORITATIVE FOR THE RECORD CONTRACT.
+#
+# This workflow builds the launcher's bundled-hex package against this
+# recorder's source and asserts only that `ct --version` matches
+# `^ct [0-9]+\.[0-9]+`.  It never runs `ct record`, never drives this recorder
+# and never inspects a produced trace, so a change that breaks capability
+# routing, a recorder CLI flag or the trace output stays GREEN here.
+#
+# THE AUTHORITY for the record contract is
+# `.github/workflows/launcher-recorder-e2e.yml` in this repo, which runs the
+# real `ct record` through the real launcher into this recorder and decodes the
+# result with `ct-print`.  That gate is CI-green (run 34449303438, 35/35).  This
+# one is retained as a fast pre-check, nothing more.
+#
+# The same header is carried by the python, ruby and js copies of this file and
+# by codetracer-launcher's cross-repo-recorder-packaging.yml.  It was missing
+# here, which an LRC-5 review recorded; this adds it.  NO LOGIC BELOW IS
+# TOUCHED.
+# =============================================================================
+
 # Single-edge cross-repo CI: when codetracer-beam-recorder changes,
 # verify the launcher's bundled-hex build still works against this
 # recorder's source. Mirrors the pattern in

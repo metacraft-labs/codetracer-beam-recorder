@@ -2,21 +2,34 @@
 # Launcher <-> recorder compatibility contract for codetracer-beam-recorder.
 #
 # ###########################################################################
-# ## STATUS: GREEN LOCALLY, NOT YET WIRED INTO ANY GATE.                    ##
+# ## STATUS: GREEN IN CI, AND WIRED INTO ALL THREE TRIGGER DIRECTIONS.      ##
 # ###########################################################################
 #
-#   `bash ci/test/launcher-recorder-e2e.sh codetracer-beam-recorder beam`
-#   reports `scenarios: 4  assertions: 40  passed: 40  failed: 0` / `PASS`
-#   (Linux x86_64, NixOS via the `eli-wsl` distro), decoding ~360 events (361
-#   and 362 on two consecutive runs -- the BEAM's own code-server traffic makes
-#   the exact count vary slightly, which is why the fixture declares a FLOOR)
-#   and finding the hop-1 proof line
-#   `launcher-recorder-e2e: component-dir=<staged bundle>` inside the trace.
-#   It is still deliberately NOT referenced by any CI workflow -- there is no
-#   `launcher-recorder-e2e.yml` caller in this repo and no `beam` row in the
-#   launcher or desktop fan-out matrices -- because wiring it is a separate,
-#   explicitly sequenced step.  See milestone LRC-4 in
+#   THIS REPO'S OWN EDGE IS GREEN ON A REAL RUNNER.  Run 34449303438
+#   (2026-09-10, push on 170246c7, job 103067559510, runner
+#   `garm-eps5ywsqysrc`, group `nixos self-hosted`) passed every step and
+#   reported `scenarios: 4  assertions: 35  passed: 35  failed: 0` / `PASS`
+#   with `decoded events: 362`, all three `LauncherCompatSample.*` functions,
+#   both recorded-stdout lines -- including the hop-1 proof
+#   `launcher-recorder-e2e: component-dir=<staged bundle>` found INSIDE the
+#   decoded trace -- and both `--out-dir` and `--source-dir` honoured.  A
+#   second green followed on 2026-09-13 (run 34762834481, `pull_request`).
+#
+#   35 ASSERTIONS, NOT THE 40 OF THE 2026-08-22 LOCAL RUN.  The count fell
+#   because the DRIVER changed, not this fixture: a 2026-09-08 review of
+#   `codetracer/ci/test/launcher-recorder-e2e.sh` tightened `validate_fixture`
+#   and collapsed the empty-recording check.  Nothing here was dropped.
+#
+#   WIRED, in all three directions: this repo's own
+#   `.github/workflows/launcher-recorder-e2e.yml` (170246c7, 2026-09-10), the
+#   `beam` row in codetracer's desktop fan-out (cc5e116b8, 2026-09-10), and the
+#   `beam` row in codetracer-launcher's fan-out (2026-09-18).  See milestone
+#   LRC-4 in
 #   codetracer-specs/Testing/Launcher-Recorder-Compatibility-Tests.milestones.org.
+#
+#   The decoded-event count is declared as a FLOOR because the BEAM's own
+#   code-server traffic makes the exact total vary slightly run to run (361 and
+#   362 were observed on two consecutive local runs; CI reported 362).
 #
 #   NOTHING IN THIS FILE WAS WEAKENED TO GET THERE.  `min-events`, the three
 #   expected functions, both recorded-stdout lines and the `--source-dir`
