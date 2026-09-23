@@ -43,6 +43,18 @@ require_symlink_target() {
   fi
 }
 
+# A path the repo must NOT carry. `-L` is checked as well as `-e` so a dangling
+# symlink (which `-e` reports as absent) is still caught.
+forbid_path() {
+  local path="$1"
+  local reason="$2"
+  if [[ -e "$path" || -L "$path" ]]; then
+    fail "$path must not exist: $reason"
+  else
+    pass "absent: $path"
+  fi
+}
+
 require_text() {
   local path="$1"
   local pattern="$2"
@@ -117,7 +129,11 @@ require_text .github/workflows/ci.yml 'just lint' "CI lint job uses just lint"
 require_text .github/workflows/ci.yml 'nix build \.#default' "CI nix-build job builds default package"
 require_text .github/workflows/ci.yml 'actions/upload-artifact@v4' "CI uploads full logs as artifacts"
 
-require_symlink_target CLAUDE.md AGENTS.md
+# metacraft-dev-guidelines policies/repo-requirements.md §7: Claude Code reads
+# AGENTS.md itself, and a CLAUDE.md shadows it — on Windows with
+# core.symlinks=false the old CLAUDE.md -> AGENTS.md symlink is checked out as
+# a file holding the single word "AGENTS.md", which is all a session then sees.
+forbid_path CLAUDE.md "Claude Code reads AGENTS.md directly and a CLAUDE.md shadows it"
 require_symlink_target .github/copilot-instructions.md ../AGENTS.md
 
 version="$(grep -E '^version = "' Cargo.toml | head -n1 | cut -d '"' -f2)"
