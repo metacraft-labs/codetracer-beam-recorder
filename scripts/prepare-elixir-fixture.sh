@@ -38,6 +38,8 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 output_dir="${1:-${ELIXIR_FIXTURE_OUTPUT_DIR:-$script_repo_root/target/fixtures/elixir-canonical-flow}}"
+# The recorder runs from the Mix project, so resolve caller-relative output first.
+[[ "$output_dir" = /* ]] || output_dir="$PWD/$output_dir"
 
 if [[ -n "${CODETRACER_BEAM_RECORDER_PATH:-}" ]]; then
   recorder_repo="$CODETRACER_BEAM_RECORDER_PATH"
@@ -102,9 +104,11 @@ recorder_bin_dir="$(cd "$(dirname "$recorder_bin")" && pwd)"
 
 if { ! command -v elixirc >/dev/null 2>&1 || ! command -v mix >/dev/null 2>&1; } &&
   [[ "${CODETRACER_ELIXIR_FIXTURE_IN_RECORDER_ENV:-0}" != "1" ]]; then
-  if [[ -f "$recorder_repo/.envrc" ]] && command -v direnv >/dev/null 2>&1; then
+  if [[ -f "$recorder_repo/repro.nim" ]] && command -v repro >/dev/null 2>&1; then
+    # Expand positional arguments in the activated child shell.
+    # shellcheck disable=SC2016
     exec env CODETRACER_ELIXIR_FIXTURE_IN_RECORDER_ENV=1 \
-      direnv exec "$recorder_repo" bash "$script_dir/prepare-elixir-fixture.sh" "$output_dir"
+      repro exec "$recorder_repo" -- bash -c 'cd "$1" && shift && exec "$@"' beam-fixture "$PWD" bash "$script_dir/prepare-elixir-fixture.sh" "$output_dir"
   fi
   if command -v nix >/dev/null 2>&1 && [[ -f "$recorder_repo/flake.nix" ]]; then
     exec env CODETRACER_ELIXIR_FIXTURE_IN_RECORDER_ENV=1 \

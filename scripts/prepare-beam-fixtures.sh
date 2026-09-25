@@ -119,6 +119,9 @@ erlang_default_out="$script_repo_root/target/fixtures/erlang-canonical-flow"
 
 elixir_out_dir="${1:-${ELIXIR_FIXTURE_OUTPUT_DIR:-$elixir_default_out}}"
 erlang_out_dir="${2:-${ERLANG_FIXTURE_OUTPUT_DIR:-$erlang_default_out}}"
+# Both recorders change directory to their fixture projects.
+[[ "$elixir_out_dir" = /* ]] || elixir_out_dir="$PWD/$elixir_out_dir"
+[[ "$erlang_out_dir" = /* ]] || erlang_out_dir="$PWD/$erlang_out_dir"
 
 mkdir -p "$(dirname "$elixir_out_dir")"
 mkdir -p "$(dirname "$erlang_out_dir")"
@@ -192,7 +195,7 @@ recorder_bin_dir="$(cd "$(dirname "$recorder_bin")" && pwd)"
 
 # ----------------------------------------------------------------------------
 # BEAM toolchain detection. If elixir/mix/erl/erlc are missing, attempt to
-# re-exec inside the recorder's nix devShell or direnv environment. If neither
+# re-exec inside the recorder's nix devShell or repro environment. If neither
 # is available, fail loudly so CI sees the diagnostic instead of producing an
 # empty fixture and skipping silently.
 # ----------------------------------------------------------------------------
@@ -204,9 +207,11 @@ beam_tools_present() {
 }
 
 if ! beam_tools_present && [[ "${CODETRACER_BEAM_FIXTURES_IN_RECORDER_ENV:-0}" != "1" ]]; then
-  if [[ -f "$recorder_repo/.envrc" ]] && command -v direnv >/dev/null 2>&1; then
+  if [[ -f "$recorder_repo/repro.nim" ]] && command -v repro >/dev/null 2>&1; then
+    # Expand positional arguments in the activated child shell.
+    # shellcheck disable=SC2016
     exec env CODETRACER_BEAM_FIXTURES_IN_RECORDER_ENV=1 \
-      direnv exec "$recorder_repo" bash "$script_dir/prepare-beam-fixtures.sh" \
+      repro exec "$recorder_repo" -- bash -c 'cd "$1" && shift && exec "$@"' beam-fixture "$PWD" bash "$script_dir/prepare-beam-fixtures.sh" \
       "$elixir_out_dir" "$erlang_out_dir"
   fi
   if command -v nix >/dev/null 2>&1 && [[ -f "$recorder_repo/flake.nix" ]]; then
@@ -217,10 +222,10 @@ if ! beam_tools_present && [[ "${CODETRACER_BEAM_FIXTURES_IN_RECORDER_ENV:-0}" !
 fi
 
 if ! beam_tools_present; then
-  command -v elixirc >/dev/null 2>&1 || fail "elixirc is required to prepare BEAM fixtures (no nix/direnv recovery available)"
-  command -v mix >/dev/null 2>&1 || fail "mix is required to prepare BEAM fixtures (no nix/direnv recovery available)"
-  command -v erl >/dev/null 2>&1 || fail "erl is required to prepare BEAM fixtures (no nix/direnv recovery available)"
-  command -v erlc >/dev/null 2>&1 || fail "erlc is required to prepare BEAM fixtures (no nix/direnv recovery available)"
+  command -v elixirc >/dev/null 2>&1 || fail "elixirc is required to prepare BEAM fixtures (no nix/repro recovery available)"
+  command -v mix >/dev/null 2>&1 || fail "mix is required to prepare BEAM fixtures (no nix/repro recovery available)"
+  command -v erl >/dev/null 2>&1 || fail "erl is required to prepare BEAM fixtures (no nix/repro recovery available)"
+  command -v erlc >/dev/null 2>&1 || fail "erlc is required to prepare BEAM fixtures (no nix/repro recovery available)"
 fi
 
 # ----------------------------------------------------------------------------
