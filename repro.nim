@@ -114,6 +114,7 @@
 ## "typed tool provisioning is required for uses declarations".
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh
 
 ## ``sh.shell`` (repro_dsl_stdlib/packages/sh.nim) intentionally does NOT
@@ -199,6 +200,9 @@ package codetracer_beam_recorder:
     name: "codetracer-beam-recorder"
 
   devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
     activity "default"
 
   build:
