@@ -2,7 +2,7 @@ name: publish-hex
 
 # Publishes codetracer-beam-recorder to Hex.pm. Fires on `v*` tag
 # pushes (the primary release path) and also accepts a manual
-# workflow_dispatch (per Repo-Requirements.md §2.8.4).
+# workflow_dispatch (per Repo-Requirements.md §2.5.4).
 #
 # Required secrets:
 #   HEX_API_KEY        Hex.pm API key with publish permission on

@@ -239,7 +239,7 @@ bump-version new_version:
       print("(cargo not on PATH; skipping cargo update)")
 
 # --- M13: Packaging UX Standardization ---
-# Implements Repo-Requirements.md §2.8 packaging UX for the BEAM
+# Implements Repo-Requirements.md §2.5 packaging UX for the BEAM
 # language-ecosystem recorder. Single channel: hex.
 
 # Build a release artifact for the given channel.
