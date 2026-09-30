@@ -14,10 +14,14 @@ defmodule CodetracerBeamRecorder.FunctionTraceTest do
   golden under `tests/goldens/canonical_flow/first-principles.org`:
 
     - `main/0` and `compute/0` are interned through recorder-owned function
-      interning and queryable through the trace reader's function table.
+      interning and queryable through the trace reader's function table,
+      after the `<toplevel>` root that the writer's `start()` interns as
+      function 0 (`codetracer-trace-format-spec/trace-events.md`
+      §"Recorder Integration — Starting a Recording").
     - `register_call` and `register_return` produce two paired call records
       mirroring the source-order Call(main) -> Call(compute) -> Return(94)
-      -> Return(94) sequence.
+      -> Return(94) sequence, nested under the `<toplevel>` root call
+      (call_key 0, depth 0).
     - When the recorded program raises an uncaught exception, the CTFS
       bundle contains an `exception_from` special event for every traced
       MFA the exception unwinds through, the recorder preserves the
@@ -77,9 +81,16 @@ defmodule CodetracerBeamRecorder.FunctionTraceTest do
 
     # First-principles golden: Call(main) -> Call(compute) -> Return(94) ->
     # Return(94). The recorder's function interner must hand out exactly two
-    # FunctionRecords keyed by {module,name,arity,kind,defining_loc}.
-    assert summary["function_count"] == 2,
-           "expected exactly 2 interned functions for canonical_flow, got #{summary["function_count"]}: #{inspect(summary["function_names"])}"
+    # FunctionRecords keyed by {module,name,arity,kind,defining_loc}, after
+    # the `<toplevel>` root the writer's `start()` registers as function 0
+    # (trace-events.md §"`<toplevel>` is the call tree's root and its id is
+    # fixed"). A recorder that ALSO registered `<toplevel>` would show up here
+    # as a fourth function.
+    assert summary["function_count"] == 3,
+           "expected <toplevel> plus 2 interned functions for canonical_flow, got #{summary["function_count"]}: #{inspect(summary["function_names"])}"
+
+    assert Enum.at(summary["function_names"], 0) == "<toplevel>",
+           "function 0 must be the writer-opened <toplevel> root; got #{inspect(summary["function_names"])}"
 
     assert "CanonicalFlow.main/0" in summary["function_names"],
            "function table must contain CanonicalFlow.main/0; got #{inspect(summary["function_names"])}"
@@ -109,13 +120,14 @@ defmodule CodetracerBeamRecorder.FunctionTraceTest do
     # `call_key` assigned at CALL ENTRY (see `codetracer_trace_writer/
     # call_stream.rs` `CallStreamBuilder.observe`, which pushes the record with
     # `call_key = records.len()` on the `Call` event; the matching `Return` only
-    # finalizes the record's contents in place). So main (entered first) comes
-    # before compute (entered second): [main, compute].
-    assert summary["call_count"] == 2,
-           "expected exactly 2 paired call records in the CTFS bundle; got #{summary["call_count"]}"
+    # finalizes the record's contents in place). The `<toplevel>` root is
+    # call_key 0, then main (entered first), then compute (entered second):
+    # [<toplevel>, main, compute].
+    assert summary["call_count"] == 3,
+           "expected the <toplevel> root plus 2 paired call records in the CTFS bundle; got #{summary["call_count"]}"
 
-    assert summary["call_function_ids"] == [main_id, compute_id],
-           "expected call records [main, compute] (call-entry order); got #{inspect(summary["call_function_ids"])} with names #{inspect(summary["function_names"])}"
+    assert summary["call_function_ids"] == [0, main_id, compute_id],
+           "expected call records [<toplevel>, main, compute] (call-entry order); got #{inspect(summary["call_function_ids"])} with names #{inspect(summary["function_names"])}"
   end
 
   test "e2e_runtime_records_real_exception_fixture" do
@@ -256,14 +268,19 @@ defmodule CodetracerBeamRecorder.FunctionTraceTest do
     # Real reader: function records, call records, and event records must
     # all be queryable through the same NimTraceReaderHandle that
     # ctfs_writer_bridge_test.exs uses.
-    assert summary["function_count"] == 2,
-           "expected 2 interned functions; got #{summary["function_count"]}: #{inspect(summary["function_names"])}"
+    # The writer's `start()` interns `<toplevel>` as function 0; the recorder
+    # adds exactly main and compute on top of it.
+    assert summary["function_count"] == 3,
+           "expected <toplevel> plus 2 interned functions; got #{summary["function_count"]}: #{inspect(summary["function_names"])}"
+
+    assert Enum.at(summary["function_names"], 0) == "<toplevel>",
+           "function 0 must be the writer-opened <toplevel> root; got #{inspect(summary["function_names"])}"
 
     assert "canonical_flow:main/0" in summary["function_names"]
     assert "canonical_flow:compute/0" in summary["function_names"]
 
-    assert summary["call_count"] == 2,
-           "expected 2 paired call records via NimTraceReaderHandle::call_count; got #{summary["call_count"]}"
+    assert summary["call_count"] == 3,
+           "expected the <toplevel> root plus 2 paired call records via NimTraceReaderHandle::call_count; got #{summary["call_count"]}"
 
     main_id =
       Enum.find_index(summary["function_names"], &(&1 == "canonical_flow:main/0"))
@@ -272,17 +289,25 @@ defmodule CodetracerBeamRecorder.FunctionTraceTest do
       Enum.find_index(summary["function_names"], &(&1 == "canonical_flow:compute/0"))
 
     # Call records are in call-entry order per the trace-format `call_key`
-    # contract (see `call_stream.rs` `CallStreamBuilder.observe`): main is
-    # entered first (call_key 0), compute second (call_key 1), so [main, compute].
-    assert summary["call_function_ids"] == [main_id, compute_id],
-           "expected call records [main, compute] (call-entry order per the trace-format call_key contract); got #{inspect(summary["call_function_ids"])}"
+    # contract (see `call_stream.rs` `CallStreamBuilder.observe`): the
+    # `<toplevel>` root is call_key 0, main is entered next (call_key 1) and
+    # compute last (call_key 2), so [<toplevel>, main, compute].
+    assert summary["call_function_ids"] == [0, main_id, compute_id],
+           "expected call records [<toplevel>, main, compute] (call-entry order per the trace-format call_key contract); got #{inspect(summary["call_function_ids"])}"
 
     # `call_json` is the raw output of `NimTraceReaderHandle::call_json` — it
     # must round-trip through serde and contain the parent/child structure. The
-    # records come out in call-entry (`call_key`) order: main first, compute second.
-    assert length(summary["call_json"]) == 2
+    # records come out in call-entry (`call_key`) order: the <toplevel> root,
+    # then main, then compute.
+    assert length(summary["call_json"]) == 3
 
-    [main_call_json, compute_call_json] = summary["call_json"]
+    [toplevel_call_json, main_call_json, compute_call_json] = summary["call_json"]
+
+    assert String.contains?(toplevel_call_json, "\"function_id\":0"),
+           "call_key 0 must be the <toplevel> root; got #{toplevel_call_json}"
+
+    assert String.contains?(toplevel_call_json, "\"children\":[1]"),
+           "the <toplevel> root must list main's call key (1) as its only child; got #{toplevel_call_json}"
 
     assert String.contains?(main_call_json, "\"function_id\":#{main_id}"),
            "first call_json must reference main's function_id; got #{main_call_json}"
@@ -290,8 +315,8 @@ defmodule CodetracerBeamRecorder.FunctionTraceTest do
     assert String.contains?(compute_call_json, "\"function_id\":#{compute_id}"),
            "second call_json must reference compute's function_id; got #{compute_call_json}"
 
-    assert String.contains?(main_call_json, "\"children\":[1]"),
-           "main's call record must list compute's call key (1) as a child; got #{main_call_json}"
+    assert String.contains?(main_call_json, "\"children\":[2]"),
+           "main's call record must list compute's call key (2) as a child; got #{main_call_json}"
 
     # event_count and step_count are non-zero — meaning the reader is
     # actually decoding the bundle, not silently returning empties.
