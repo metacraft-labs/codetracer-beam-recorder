@@ -24,6 +24,11 @@ fail() {
 
 [[ -d "$trace_format_dir/.git" ]] || fail "missing sibling checkout: $trace_format_dir"
 
+# Run from a git hook, this script inherits the recorder's GIT_DIR (and
+# GIT_INDEX_FILE / GIT_WORK_TREE), which override `git -C` and would make every
+# query below read the recorder's repository instead of the sibling's.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
+
 actual_sha="$(git -C "$trace_format_dir" rev-parse HEAD)"
 git -C "$trace_format_dir" cat-file -e "$minimum_sha^{commit}" 2>/dev/null ||
   fail "codetracer-trace-format does not contain $minimum_sha at all; fetch it"
