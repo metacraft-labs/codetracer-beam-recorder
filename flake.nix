@@ -129,7 +129,39 @@
               ]
               ++ preCommit.enabledPackages;
 
-            shellHook = preCommit.shellHook;
+            # `cargo <subcommand>` looks for `cargo-<subcommand>` in
+            # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with
+            # rustup — including self-hosted macOS runners — that directory
+            # holds rustup's proxies, so `cargo fmt` and `cargo clippy` run
+            # rustup's `cargo-fmt` / `cargo-clippy` instead of the rustfmt and
+            # clippy above, and fail with "'cargo-fmt' is not installed for the
+            # toolchain".
+            #
+            # The shell therefore gets its own CARGO_HOME with no `bin/`, so
+            # subcommand lookup falls through to PATH. `registry/` and `git/`
+            # are symlinks to the real CARGO_HOME, and so are its config and
+            # credentials when present: the download cache is shared, and only
+            # the proxy directory is left behind.
+            shellHook = preCommit.shellHook + ''
+              _beam_real_cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
+              _beam_cargo_home="''${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-beam-recorder/cargo-home"
+              if [ "$_beam_real_cargo_home" != "$_beam_cargo_home" ]; then
+                mkdir -p "$_beam_cargo_home" \
+                  "$_beam_real_cargo_home/registry" "$_beam_real_cargo_home/git"
+                # Re-pointed on every entry, so a changed CARGO_HOME is followed
+                # rather than left sharing the previous one's cache. Only a link
+                # is ever replaced; a real file placed here is left alone.
+                for _beam_entry in registry git config.toml credentials.toml; do
+                  if [ -e "$_beam_real_cargo_home/$_beam_entry" ] &&
+                    { [ -L "$_beam_cargo_home/$_beam_entry" ] ||
+                      [ ! -e "$_beam_cargo_home/$_beam_entry" ]; }; then
+                    ln -sfn "$_beam_real_cargo_home/$_beam_entry" "$_beam_cargo_home/$_beam_entry"
+                  fi
+                done
+                export CARGO_HOME="$_beam_cargo_home"
+              fi
+              unset _beam_real_cargo_home _beam_cargo_home _beam_entry
+            '';
           };
 
           packages.codetracer-beam-recorder = mkBeamRecorderPackage { inherit pkgs; };

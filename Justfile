@@ -1,14 +1,14 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 build:
-  if ! command -v cargo >/dev/null 2>&1; then nix develop --command just build; else just build-native; fi
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v nimble >/dev/null 2>&1; then nix develop --command just build; else just build-native; fi
 
 build-native:
   cargo build --locked
   cd rebar3_codetracer && rebar3 compile
 
 test:
-  if ! command -v cargo >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v elixir >/dev/null 2>&1 || ! command -v mix >/dev/null 2>&1 || ! command -v erl >/dev/null 2>&1 || ! command -v erlc >/dev/null 2>&1 || ! command -v rebar3 >/dev/null 2>&1; then nix develop --command just test; else just test-rust && just test-goldens && just test-elixir && just test-erlang && just verify-trace-format-dependency && just test-integration && just verify-elixir-fixture-generation-no-silent-skip && just verify-beam-fixture-generation-no-silent-skip && just verify-runtime-session-test-no-silent-skip && just verify-launch-targets-test-no-silent-skip && just verify-function-trace-test-no-silent-skip && just verify-message-trace-test-no-silent-skip && just verify-manifest-source-location-test-no-silent-skip && just verify-step-instrumentation-test-no-silent-skip && just verify-native-tracer-parity-test-no-silent-skip && just verify-native-tracer-ordering-test-no-silent-skip && just verify-native-tracer-overflow-test-no-silent-skip && just verify-native-tracer-bench-test-no-silent-skip && just verify-otp-fixture-matrix-test-no-silent-skip && just verify-plug-smoke-test-no-silent-skip && just verify-plug-requests-test-no-silent-skip && just verify-phoenix-requests-test-no-silent-skip && just verify-nested-requests-test-no-silent-skip && just verify-stress-event-volume-test-no-silent-skip && just verify-release-check-no-silent-skip; fi
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v nimble >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v elixir >/dev/null 2>&1 || ! command -v mix >/dev/null 2>&1 || ! command -v erl >/dev/null 2>&1 || ! command -v erlc >/dev/null 2>&1 || ! command -v rebar3 >/dev/null 2>&1; then nix develop --command just test; else just test-rust && just test-goldens && just test-elixir && just test-erlang && just verify-trace-format-dependency && just test-integration && just verify-elixir-fixture-generation-no-silent-skip && just verify-beam-fixture-generation-no-silent-skip && just verify-runtime-session-test-no-silent-skip && just verify-launch-targets-test-no-silent-skip && just verify-function-trace-test-no-silent-skip && just verify-message-trace-test-no-silent-skip && just verify-manifest-source-location-test-no-silent-skip && just verify-step-instrumentation-test-no-silent-skip && just verify-native-tracer-parity-test-no-silent-skip && just verify-native-tracer-ordering-test-no-silent-skip && just verify-native-tracer-overflow-test-no-silent-skip && just verify-native-tracer-bench-test-no-silent-skip && just verify-otp-fixture-matrix-test-no-silent-skip && just verify-plug-smoke-test-no-silent-skip && just verify-plug-requests-test-no-silent-skip && just verify-phoenix-requests-test-no-silent-skip && just verify-nested-requests-test-no-silent-skip && just verify-stress-event-volume-test-no-silent-skip && just verify-release-check-no-silent-skip; fi
 
 t: test
 
@@ -177,7 +177,7 @@ record-request-panel-fixture OUT FRAMEWORK="plug":
   echo "[fixture] wrote {{OUT}}/app.ct"
 
 lint:
-  if ! command -v cargo >/dev/null 2>&1 || ! command -v nixfmt >/dev/null 2>&1 || ! command -v shellcheck >/dev/null 2>&1; then nix develop --command just lint; else just lint-nix && just lint-rust && just lint-shell && just verify-repo-requirements && just verify-trace-format-dependency; fi
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v nimble >/dev/null 2>&1 || ! command -v nixfmt >/dev/null 2>&1 || ! command -v shellcheck >/dev/null 2>&1; then nix develop --command just lint; else just lint-nix && just lint-rust && just lint-shell && just verify-repo-requirements && just verify-trace-format-dependency; fi
 
 lint-nix:
   nixfmt --check flake.nix
