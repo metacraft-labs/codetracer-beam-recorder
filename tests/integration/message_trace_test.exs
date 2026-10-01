@@ -329,6 +329,101 @@ defmodule CodetracerBeamRecorder.MessageTraceTest do
     end
   end
 
+  # The recorder's runtime is itself a set of BEAM processes: the
+  # instrumented program reaches the session with `gen_server:call/3` on every
+  # step and binding, and the session replies. Those exchanges are the
+  # recorder's machinery, not the program's messages. Recorded as program
+  # traffic they made up 40% of a 100k-call recording's sidecar, showed the
+  # recorder's session as one of the program's threads, and put two
+  # `beam_message` events the program never sent around every step.
+  #
+  # `spawn_messages:main/0` sends exactly four messages (three between parent
+  # and child, plus the `io_request` behind its `io:format/1`) and receives the
+  # matching four, so the recording must hold exactly those, under either
+  # tracer backend.
+  for backend <- ["process", "native"] do
+    test "e2e_runtime_messages_exclude_recorder_traffic_#{backend}_backend" do
+      backend = unquote(backend)
+      out_dir = tmp_dir!("m6-erlang-own-traffic-#{backend}")
+      ebin_dir = tmp_dir!("m6-erlang-own-traffic-ebin-#{backend}")
+      compile_erlang_spawn_fixture!(ebin_dir)
+
+      {output, status} =
+        System.cmd(
+          recorder_binary!(),
+          [
+            "record",
+            "--tracer-backend",
+            backend,
+            "--out-dir",
+            out_dir,
+            "--",
+            "erl",
+            "-noshell",
+            "-pa",
+            ebin_dir,
+            "-s",
+            "spawn_messages",
+            "main",
+            "-s",
+            "init",
+            "stop"
+          ],
+          cd: @erlang_spawn_fixture,
+          stderr_to_stdout: true
+        )
+
+      assert status == 0, """
+      spawn_messages fixture record (#{backend} backend) failed with status #{status}
+
+      #{output}
+      """
+
+      summary = read_bundle_summary!(out_dir)
+      records = summary["event_log_records"]
+
+      sent = for r <- records, r["direction"] == "send", do: r["tag"]
+      received = for r <- records, r["direction"] == "receive", do: r["tag"]
+
+      assert Enum.sort(sent) ==
+               Enum.sort(["spawn_child_started", "spawn_ping", "spawn_pong", "io_request"]),
+             "#{backend}: the recording must hold the program's four sends and nothing " <>
+               "else; got #{inspect(sent)}"
+
+      assert Enum.sort(received) ==
+               Enum.sort(["spawn_child_started", "spawn_ping", "spawn_pong", "io_reply"]),
+             "#{backend}: the recording must hold the program's four receives and nothing " <>
+               "else; got #{inspect(received)}"
+
+      assert summary["send_event_count"] == 4 and summary["receive_event_count"] == 4,
+             "#{backend}: the sidecar must carry 4 sends and 4 receives; got " <>
+               "#{summary["send_event_count"]} / #{summary["receive_event_count"]}"
+
+      # Every recorded thread is the root or a party to one of the program's
+      # own messages; the recorder's session process is neither.
+      parties =
+        records
+        |> Enum.flat_map(&[&1["sender"], &1["recipient"]])
+        |> MapSet.new()
+
+      threads =
+        Path.join(out_dir, "runtime_session.jsonl")
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.contains?(&1, ~s("event":"thread_start")))
+        |> Enum.map(fn line ->
+          [_, pid] = Regex.run(~r/"pid":"([^"]+)"/, line)
+          {pid, String.contains?(line, ~s("thread_id":1,))}
+        end)
+
+      for {pid, root?} <- threads do
+        assert root? or MapSet.member?(parties, pid),
+               "#{backend}: thread #{pid} is neither the root nor a party to any program " <>
+                 "message: #{inspect(threads)}"
+      end
+    end
+  end
+
   defp recorder_binary! do
     case System.get_env("CODETRACER_BEAM_RECORDER_BIN") do
       nil ->

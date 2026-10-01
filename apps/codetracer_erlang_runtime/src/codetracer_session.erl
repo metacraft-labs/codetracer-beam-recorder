@@ -6,6 +6,7 @@
 -export([start/2, stop/1]).
 -export([start_session/1, step/1, bind_many/1, stop_session/1]).
 -export([web_request_start/1, web_request_stop/2]).
+-export([recorder_traffic/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -record(state, {
@@ -680,7 +681,39 @@ drain_trace_messages(File, State) ->
         State
     end.
 
-write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) ->
+%% A message between the program and the recorder's own runtime processes is
+%% the recorder at work, not the program: the instrumented code reaches the
+%% session with `gen_server:call/3' on every step and binding. Such messages
+%% are dropped before they reach the sidecar, and the session never becomes
+%% one of the recording's threads.
+write_trace_message(File, Message, State) ->
+    case recorder_traffic(Message) of
+        true -> {ok, State};
+        false -> write_program_trace_message(File, Message, State)
+    end.
+
+%% True for a send to, or a receive from, a recorder runtime process (this
+%% session or the native tracer), whether it is named by pid or by its
+%% registered name.
+recorder_traffic({trace, _Pid, send, _Message, Recipient}) ->
+    recorder_process(Recipient);
+recorder_traffic({trace, _Pid, send_to_non_existing_process, _Message, Recipient}) ->
+    recorder_process(Recipient);
+recorder_traffic({trace, _Pid, 'receive', _Message, Sender}) ->
+    recorder_process(Sender);
+recorder_traffic(_Message) ->
+    false.
+
+recorder_process(Name) when Name =:= ?MODULE; Name =:= codetracer_native_tracer ->
+    true;
+recorder_process({Name, Node}) when is_atom(Name), Node =:= node() ->
+    recorder_process(Name);
+recorder_process(Pid) when is_pid(Pid) ->
+    Pid =:= whereis(?MODULE) orelse Pid =:= whereis(codetracer_native_tracer);
+recorder_process(_Other) ->
+    false.
+
+write_program_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) ->
     {ThreadId, State1} = ensure_event_thread(File, Pid, State0),
     Metadata = source_metadata(Module, Function, length(Args), State1),
     {FrameId, State} = push_frame(Pid, Metadata, State1),
@@ -700,7 +733,7 @@ write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) 
     ],
     ok = file:write(File, Line),
     {ok, State};
-write_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, ReturnValue}, State0) ->
+write_program_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, ReturnValue}, State0) ->
     {ThreadId, State} = ensure_event_thread(File, Pid, State0),
     {FrameInfo, State1} = pop_frame(Pid, State),
     SourceLanguage = frame_source_language(FrameInfo),
@@ -719,7 +752,7 @@ write_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, R
     ok = file:write(File, Line),
     ok = write_drop_variables(File, Pid, ThreadId, FrameInfo),
     {ok, State1};
-write_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}, {Class, Reason}}, State0) ->
+write_program_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}, {Class, Reason}}, State0) ->
     {ThreadId, State} = ensure_event_thread(File, Pid, State0),
     {FrameInfo, State1} = pop_frame(Pid, State),
     SourceLanguage = frame_source_language(FrameInfo),
@@ -740,7 +773,7 @@ write_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}
     ok = file:write(File, Line),
     ok = write_drop_variables(File, Pid, ThreadId, FrameInfo),
     {ok, State1};
-write_trace_message(File, {trace, Pid, spawn, ChildPid, {Module, Function, Args}}, State0) ->
+write_program_trace_message(File, {trace, Pid, spawn, ChildPid, {Module, Function, Args}}, State0) ->
     {_ParentThreadId, State1} = ensure_event_thread(File, Pid, State0),
     {_ChildThreadId, State} = ensure_pid_thread(File, ChildPid, State1),
     Line = [
@@ -754,7 +787,7 @@ write_trace_message(File, {trace, Pid, spawn, ChildPid, {Module, Function, Args}
     ],
     ok = file:write(File, Line),
     {ok, State};
-write_trace_message(File, {trace, Pid, spawned, ParentPid, {Module, Function, Args}}, State0) ->
+write_program_trace_message(File, {trace, Pid, spawned, ParentPid, {Module, Function, Args}}, State0) ->
     {ThreadId, State} = ensure_event_thread(File, Pid, State0),
     Line = [
         "{\"event\":\"process_spawned\",",
@@ -768,7 +801,7 @@ write_trace_message(File, {trace, Pid, spawned, ParentPid, {Module, Function, Ar
     ],
     ok = file:write(File, Line),
     {ok, State};
-write_trace_message(File, {trace, Pid, exit, Reason}, State0) ->
+write_program_trace_message(File, {trace, Pid, exit, Reason}, State0) ->
     {ThreadId, State1} = ensure_event_thread(File, Pid, State0),
     PidText = pid_to_list(Pid),
     case maps:is_key(PidText, State1#state.exited_pids) of
@@ -786,7 +819,7 @@ write_trace_message(File, {trace, Pid, exit, Reason}, State0) ->
             ok = file:write(File, Line),
             {ok, State1#state{exited_pids = maps:put(PidText, true, State1#state.exited_pids)}}
     end;
-write_trace_message(File, {trace, Pid, send, Message, Recipient}, State0) ->
+write_program_trace_message(File, {trace, Pid, send, Message, Recipient}, State0) ->
     {SenderThreadId, State1} = ensure_event_thread(File, Pid, State0),
     {RecipientPidText, RecipientThreadId, State} = recipient_thread(File, Recipient, State1),
     ok = write_message_event(
@@ -800,7 +833,7 @@ write_trace_message(File, {trace, Pid, send, Message, Recipient}, State0) ->
         Message
     ),
     {ok, State};
-write_trace_message(File, {trace, Pid, send_to_non_existing_process, Message, Recipient}, State0) ->
+write_program_trace_message(File, {trace, Pid, send_to_non_existing_process, Message, Recipient}, State0) ->
     {SenderThreadId, State} = ensure_event_thread(File, Pid, State0),
     ok = write_message_event(
         File,
@@ -813,7 +846,7 @@ write_trace_message(File, {trace, Pid, send_to_non_existing_process, Message, Re
         Message
     ),
     {ok, State};
-write_trace_message(File, {trace, Pid, 'receive', Message, Sender}, State0) ->
+write_program_trace_message(File, {trace, Pid, 'receive', Message, Sender}, State0) ->
     {RecipientThreadId, State1} = ensure_event_thread(File, Pid, State0),
     {SenderPidText, SenderThreadId, State} = sender_thread(File, Sender, State1),
     ok = write_message_event(
@@ -827,7 +860,7 @@ write_trace_message(File, {trace, Pid, 'receive', Message, Sender}, State0) ->
         Message
     ),
     {ok, State};
-write_trace_message(File, {trace, Pid, 'receive', Message}, State0) ->
+write_program_trace_message(File, {trace, Pid, 'receive', Message}, State0) ->
     {RecipientThreadId, State} = ensure_event_thread(File, Pid, State0),
     ok = write_message_event(
         File,
@@ -840,7 +873,7 @@ write_trace_message(File, {trace, Pid, 'receive', Message}, State0) ->
         Message
     ),
     {ok, State};
-write_trace_message(_File, _Message, _State) ->
+write_program_trace_message(_File, _Message, _State) ->
     ignore.
 
 source_metadata(Module, Function, Arity, #state{manifest_index = ManifestIndex}) ->

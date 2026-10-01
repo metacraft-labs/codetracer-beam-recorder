@@ -60,6 +60,15 @@ recorder writer (`codetracer_session:install_message_trace_patterns/1`)
 rather than per-module: once enabled, every BEAM process'
 mailbox traffic is observed.
 
+The one exception is the recorder's own traffic. Instrumented code
+reports every step and binding to the recorder's session process
+with `gen_server:call/3`, so a send to, or a receive from, the
+session or the native tracer process is dropped before it reaches
+the sidecar. It is the recorder at work, not the program. Recorded,
+it added two `beam_message` events around every step, showed the
+session as one of the program's threads, and made up about 40% of
+the sidecar of a call-heavy recording.
+
 ## Defaults
 
 By default the recorder traces every module it can resolve a

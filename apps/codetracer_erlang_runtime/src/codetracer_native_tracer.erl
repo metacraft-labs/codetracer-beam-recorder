@@ -256,7 +256,15 @@ code_change(_OldVsn, State, _Extra) ->
 %% Trace handlers
 %% ---------------------------------------------------------------------
 
-handle_trace_message({trace, Pid, call, {Module, Function, Args}}, State0) ->
+%% Messages between the program and the recorder's runtime processes are the
+%% recorder at work, not the program; see codetracer_session:recorder_traffic/1.
+handle_trace_message(Msg, State) ->
+    case codetracer_session:recorder_traffic(Msg) of
+        true -> State;
+        false -> handle_program_trace_message(Msg, State)
+    end.
+
+handle_program_trace_message({trace, Pid, call, {Module, Function, Args}}, State0) ->
     {ThreadId, State1} = ensure_event_thread(Pid, State0),
     Metadata = source_metadata(Module, Function, length(Args), State1),
     {FrameId, State2} = push_frame(Pid, Metadata, State1),
@@ -279,7 +287,7 @@ handle_trace_message({trace, Pid, call, {Module, Function, Args}}, State0) ->
     ],
     ok = file:write(State2#state.file, Line),
     State2;
-handle_trace_message({trace, Pid, return_from, {Module, Function, Arity}, ReturnValue}, State0) ->
+handle_program_trace_message({trace, Pid, return_from, {Module, Function, Arity}, ReturnValue}, State0) ->
     {ThreadId, State1} = ensure_event_thread(Pid, State0),
     {FrameInfo, State2} = pop_frame(Pid, State1),
     SourceLanguage = frame_source_language(FrameInfo),
@@ -300,7 +308,7 @@ handle_trace_message({trace, Pid, return_from, {Module, Function, Arity}, Return
     ],
     ok = file:write(State2#state.file, Line),
     State2;
-handle_trace_message({trace, Pid, exception_from, {Module, Function, Arity}, {Class, Reason}}, State0) ->
+handle_program_trace_message({trace, Pid, exception_from, {Module, Function, Arity}, {Class, Reason}}, State0) ->
     {ThreadId, State1} = ensure_event_thread(Pid, State0),
     {FrameInfo, State2} = pop_frame(Pid, State1),
     SourceLanguage = frame_source_language(FrameInfo),
@@ -323,7 +331,7 @@ handle_trace_message({trace, Pid, exception_from, {Module, Function, Arity}, {Cl
     ],
     ok = file:write(State2#state.file, Line),
     State2;
-handle_trace_message({trace, Pid, spawn, ChildPid, {Module, Function, Args}}, State0) ->
+handle_program_trace_message({trace, Pid, spawn, ChildPid, {Module, Function, Args}}, State0) ->
     {_ParentThreadId, State1} = ensure_event_thread(Pid, State0),
     {_ChildThreadId, State2} = ensure_pid_thread(ChildPid, State1),
     Seq = next_seq(State2),
@@ -340,7 +348,7 @@ handle_trace_message({trace, Pid, spawn, ChildPid, {Module, Function, Args}}, St
     ],
     ok = file:write(State2#state.file, Line),
     State2;
-handle_trace_message({trace, Pid, spawned, ParentPid, {Module, Function, Args}}, State0) ->
+handle_program_trace_message({trace, Pid, spawned, ParentPid, {Module, Function, Args}}, State0) ->
     {ThreadId, State1} = ensure_event_thread(Pid, State0),
     Seq = next_seq(State1),
     Line = [
@@ -357,7 +365,7 @@ handle_trace_message({trace, Pid, spawned, ParentPid, {Module, Function, Args}},
     ],
     ok = file:write(State1#state.file, Line),
     State1;
-handle_trace_message({trace, Pid, exit, Reason}, State0) ->
+handle_program_trace_message({trace, Pid, exit, Reason}, State0) ->
     {ThreadId, State1} = ensure_event_thread(Pid, State0),
     PidText = pid_to_list(Pid),
     case maps:is_key(PidText, State1#state.exited_pids) of
@@ -378,33 +386,33 @@ handle_trace_message({trace, Pid, exit, Reason}, State0) ->
             ok = file:write(State1#state.file, Line),
             State1#state{exited_pids = maps:put(PidText, true, State1#state.exited_pids)}
     end;
-handle_trace_message({trace, Pid, send, Message, Recipient}, State0) ->
+handle_program_trace_message({trace, Pid, send, Message, Recipient}, State0) ->
     {SenderThreadId, State1} = ensure_event_thread(Pid, State0),
     {RecipientPidText, RecipientThreadId, State2} = recipient_thread(Recipient, State1),
     write_message_event(
         State2#state.file, "message_send", "send", Pid, SenderThreadId,
         RecipientPidText, RecipientThreadId, Message, next_seq(State2)),
     State2;
-handle_trace_message({trace, Pid, send_to_non_existing_process, Message, Recipient}, State0) ->
+handle_program_trace_message({trace, Pid, send_to_non_existing_process, Message, Recipient}, State0) ->
     {SenderThreadId, State1} = ensure_event_thread(Pid, State0),
     write_message_event(
         State1#state.file, "message_send", "send_to_non_existing_process", Pid,
         SenderThreadId, recipient_text(Recipient), undefined, Message, next_seq(State1)),
     State1;
-handle_trace_message({trace, Pid, 'receive', Message, Sender}, State0) ->
+handle_program_trace_message({trace, Pid, 'receive', Message, Sender}, State0) ->
     {RecipientThreadId, State1} = ensure_event_thread(Pid, State0),
     {SenderPidText, SenderThreadId, State2} = sender_thread(Sender, State1),
     write_message_event(
         State2#state.file, "message_receive", "receive", SenderPidText,
         SenderThreadId, pid_to_list(Pid), RecipientThreadId, Message, next_seq(State2)),
     State2;
-handle_trace_message({trace, Pid, 'receive', Message}, State0) ->
+handle_program_trace_message({trace, Pid, 'receive', Message}, State0) ->
     {RecipientThreadId, State1} = ensure_event_thread(Pid, State0),
     write_message_event(
         State1#state.file, "message_receive", "receive", undefined, undefined,
         pid_to_list(Pid), RecipientThreadId, Message, next_seq(State1)),
     State1;
-handle_trace_message(_Other, State) ->
+handle_program_trace_message(_Other, State) ->
     State.
 
 %% ---------------------------------------------------------------------
