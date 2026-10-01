@@ -963,7 +963,7 @@ defmodule CodetracerBeamRecorder.ElixirSourceMap do
       |> Enum.with_index(1)
       |> Enum.map(fn {source_map, index} ->
         filename =
-          "#{String.pad_leading(Integer.to_string(index), 3, "0")}-#{safe_filename(project_relative_path(source_root, source_map.generated_path))}.json"
+          "#{String.pad_leading(Integer.to_string(index), 3, "0")}-#{safe_filename(source_map_name_path(source_root, build_dir, source_map.generated_path))}.json"
 
         destination = Path.join(source_maps_root, filename)
         File.write!(destination, JasonCompat.encode_pretty!(source_map))
@@ -1178,6 +1178,26 @@ defmodule CodetracerBeamRecorder.ElixirSourceMap do
     case Path.relative_to(path, source_root) do
       ^path -> path
       relative -> relative
+    end
+  end
+
+  # The path a source-map artifact is named after: relative to the project
+  # when the generated file is in it, else relative to the build directory
+  # (where Mix-generated Erlang such as a `@derive` implementation lives).
+  # Never the absolute path: the name would then change with the build
+  # directory's location and, for a deep one, exceed the file-name limit.
+  defp source_map_name_path(source_root, build_dir, path) do
+    expanded = Path.expand(path)
+
+    case project_relative_path(source_root, expanded) do
+      ^expanded ->
+        case Path.relative_to(expanded, Path.expand(build_dir)) do
+          ^expanded -> expanded
+          relative -> relative
+        end
+
+      relative ->
+        relative
     end
   end
 

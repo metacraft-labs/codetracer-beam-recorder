@@ -3490,6 +3490,75 @@ fn e2e_elixir_protocol_macro_behaviour_matrix() {
     });
 }
 
+fn source_map_file_names(out_dir: &Path) -> Vec<String> {
+    let root = out_dir.join("recorder_metadata/source_maps");
+    let mut names = fs::read_dir(&root)
+        .unwrap_or_else(|error| panic!("read {}: {error}", root.display()))
+        .map(|entry| {
+            entry
+                .expect("source-map entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+/// A Mix build's generated Erlang (here a `@derive` protocol implementation)
+/// lives in the build directory, outside the project. Its source-map artifact
+/// must be named from its place in the build directory, not from the absolute
+/// path: the name is then the same wherever the build directory is, and a
+/// deep build directory cannot push it past the file-name length limit.
+#[test]
+fn e2e_elixir_source_map_names_do_not_depend_on_the_build_dir_location() {
+    let short = record_mix_task_eval(
+        "m15-srcmap-short",
+        "protocol_macro_behaviour",
+        "ProtocolMacroBehaviour.main()",
+        &[],
+    );
+    assert_eq!(
+        short.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&short.output)
+    );
+
+    // 120 more bytes of build-directory path than the recording above.
+    let deep_label = format!("m15-srcmap-deep-{}", "d".repeat(120));
+    let deep = record_mix_task_eval(
+        &deep_label,
+        "protocol_macro_behaviour",
+        "ProtocolMacroBehaviour.main()",
+        &[],
+    );
+    assert_eq!(
+        deep.output.status.code(),
+        Some(0),
+        "a deep build directory must not make the recording fail: {}",
+        output_text(&deep.output)
+    );
+
+    let short_names = source_map_file_names(&short.out_dir);
+    let deep_names = source_map_file_names(&deep.out_dir);
+    assert!(
+        short_names.iter().any(|name| name.contains("DerivedItem")),
+        "the generated @derive implementation should have a source map: {short_names:#?}"
+    );
+    for name in &short_names {
+        assert!(
+            !name.contains("m15-srcmap-short"),
+            "source-map name {name} embeds the build directory's location"
+        );
+    }
+    assert_eq!(
+        short_names, deep_names,
+        "source-map names must not depend on where the build directory is"
+    );
+}
+
 #[test]
 fn e2e_elixir_reference_edge_constructs() {
     let recorded = record_mix_task_eval(
