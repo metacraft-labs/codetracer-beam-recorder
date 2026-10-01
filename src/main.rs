@@ -3880,7 +3880,7 @@ fn compile_runtime_app_with(
     let src_dir = repo_root.join("apps/codetracer_erlang_runtime/src");
     let build_dir = out_dir.join("runtime").join(RUNTIME_APP_NAME);
     let ebin_dir = build_dir.join("ebin");
-    fs::create_dir_all(&ebin_dir)?;
+    fs::create_dir_all(&ebin_dir).map_err(at_path(&ebin_dir))?;
 
     for module in [
         "codetracer_erlang_runtime.erl",
@@ -3903,10 +3903,9 @@ fn compile_runtime_app_with(
         }
     }
 
-    fs::copy(
-        src_dir.join(format!("{RUNTIME_APP_NAME}.app.src")),
-        ebin_dir.join(format!("{RUNTIME_APP_NAME}.app")),
-    )?;
+    let app_src = src_dir.join(format!("{RUNTIME_APP_NAME}.app.src"));
+    fs::copy(&app_src, ebin_dir.join(format!("{RUNTIME_APP_NAME}.app")))
+        .map_err(at_path(&app_src))?;
     Ok(ebin_dir)
 }
 
@@ -3940,7 +3939,33 @@ fn run_beam_tool(program: &str, args: &[&str]) -> io::Result<std::process::Outpu
         .as_deref()
         .map(|p| p.as_os_str())
         .unwrap_or_else(|| program.as_ref());
-    Command::new(program_os).args(args).output()
+    Command::new(program_os)
+        .args(args)
+        .output()
+        .map_err(|error| spawn_error(program, resolved.as_deref(), error))
+}
+
+/// A BEAM tool that could not be started, named. The OS error alone ("No such
+/// file or directory") says neither which program was missing nor where it was
+/// looked up, which leaves a failed recording untraceable. The error kind is
+/// kept so callers that branch on it still can.
+fn spawn_error(program: &str, resolved: Option<&Path>, error: io::Error) -> io::Error {
+    let looked_up = match resolved {
+        Some(path) => format!("resolved to {}", path.display()),
+        None => format!(
+            "not found on PATH={}",
+            env::var("PATH").unwrap_or_else(|_| "<unset>".to_string())
+        ),
+    };
+    io::Error::new(
+        error.kind(),
+        format!("failed to run `{program}` ({looked_up}): {error}"),
+    )
+}
+
+/// Attach the path an I/O step was operating on to its error, keeping the kind.
+fn at_path(path: &Path) -> impl FnOnce(io::Error) -> io::Error + '_ {
+    move |error| io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }
 
 fn compile_erlang_runtime_source(
@@ -6549,9 +6574,11 @@ fn find_single_ct_file(bundle_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_target_language, is_beam_target, parse_fixture_options, parse_record_options,
-        runtime_compiler_for_target, ParsedRecordCommand, RuntimeCompiler,
+        compile_runtime_app_with, detect_target_language, is_beam_target, parse_fixture_options,
+        parse_record_options, run_beam_tool, runtime_compiler_for_target, ParsedRecordCommand,
+        RuntimeCompiler, RUNTIME_APP_NAME,
     };
+    use std::{fs, io};
 
     /// The five launch commands this recorder claims to instrument, and the
     /// source language each one implies. `elixir` and `escript` are the two
@@ -6699,5 +6726,54 @@ mod tests {
         let options = parse_fixture_options(vec!["--out-dir".into(), "/tmp/trace".into()]).unwrap();
 
         assert_eq!(options.out_dir, std::path::PathBuf::from("/tmp/trace"));
+    }
+
+    /// A BEAM tool that cannot be started is reported by name. A bare
+    /// "No such file or directory (os error 2)" names neither the program nor
+    /// the PATH it was looked up in, and a recording that failed that way
+    /// could not be traced back to a missing `erlc`.
+    #[test]
+    fn a_beam_tool_that_cannot_start_is_named_in_the_error() {
+        let error = run_beam_tool("codetracer-no-such-beam-tool", &["-version"])
+            .expect_err("a program that does not exist cannot start");
+        let message = error.to_string();
+        assert!(
+            message.contains("codetracer-no-such-beam-tool"),
+            "the error must name the program: {message}"
+        );
+        assert!(
+            message.contains("PATH"),
+            "the error must say where it was looked up: {message}"
+        );
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::NotFound,
+            "the kind is preserved"
+        );
+    }
+
+    /// The runtime build names the file it could not read or write.
+    #[test]
+    fn a_runtime_build_into_an_unusable_directory_names_the_path() {
+        let scratch = std::env::temp_dir().join(format!("ct-beam-runtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).unwrap();
+        // A FILE where the runtime's build directory has to go.
+        let blocker = scratch.join("runtime");
+        fs::write(&blocker, b"not a directory").unwrap();
+        let error = compile_runtime_app_with(&scratch, RuntimeCompiler::Erlc)
+            .expect_err("the build directory cannot be created under a file");
+        let message = error.to_string();
+        let _ = fs::remove_dir_all(&scratch);
+        assert!(
+            message.contains(
+                &blocker
+                    .join(RUNTIME_APP_NAME)
+                    .join("ebin")
+                    .display()
+                    .to_string()
+            ),
+            "the error must name the directory it could not create: {message}"
+        );
     }
 }
