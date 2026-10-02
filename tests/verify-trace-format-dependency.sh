@@ -22,7 +22,9 @@ fail() {
   exit 1
 }
 
-[[ -d "$trace_format_dir/.git" ]] || fail "missing sibling checkout: $trace_format_dir"
+# `.git` is a directory in a clone and a file in a linked worktree; both are
+# checkouts.
+[[ -e "$trace_format_dir/.git" ]] || fail "missing sibling checkout: $trace_format_dir"
 
 # Run from a git hook, this script inherits the recorder's GIT_DIR (and
 # GIT_INDEX_FILE / GIT_WORK_TREE), which override `git -C` and would make every
