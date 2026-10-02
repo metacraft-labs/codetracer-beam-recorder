@@ -47,6 +47,7 @@ test-integration:
   elixir tests/integration/phoenix_requests_test.exs
   elixir tests/integration/nested_requests_test.exs
   elixir tests/integration/stress_event_volume_test.exs
+  elixir tests/integration/deep_call_nesting_test.exs
 
 verify-trace-format-dependency:
   bash tests/verify-trace-format-dependency.sh
