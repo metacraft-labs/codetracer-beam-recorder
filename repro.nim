@@ -407,6 +407,7 @@ package codetracer_beam_recorder:
     const beamIntegrationTests = [
       "ctfs_writer_bridge_test",
       "runtime_session_test",
+      "launch_targets_test",
       "function_trace_test",
       "message_trace_test",
       "manifest_source_location_test",
@@ -428,7 +429,8 @@ package codetracer_beam_recorder:
       # served inside another on ONE process, so the session's per-pid
       # trace bookkeeping is exercised. Needs the same ``deps/`` fetch.
       "nested_requests_test",
-      "stress_event_volume_test"
+      "stress_event_volume_test",
+      "deep_call_nesting_test"
     ]
     # Per-test ExUnit timeout (ms) applied to the MONITORED integration
     # edges only. The reprobuild automatic monitor LD_PRELOADs the io-mon
@@ -497,6 +499,7 @@ package codetracer_beam_recorder:
       "elixir-fixture-generation",
       "beam-fixture-generation",
       "runtime-session-test",
+      "launch-targets-test",
       "function-trace-test",
       "message-trace-test",
       "manifest-source-location-test",
@@ -509,6 +512,7 @@ package codetracer_beam_recorder:
       "plug-smoke-test",
       "plug-requests-test",
       "phoenix-requests-test",
+      "nested-requests-test",
       "stress-event-volume-test",
       "release-check"
     ]

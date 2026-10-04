@@ -6411,9 +6411,9 @@ fn read_bundle_summary(
         };
 
         // Recorded program output. The metadata slot carries the stream name
-        // the recorder wrote it under (`stdout` / `stderr`); the CTFS event
-        // kind alone cannot tell them apart, because the container collapses
-        // every write kind onto one coarse `stdout` kind.
+        // the recorder wrote it under (`stdout` / `stderr`). The decoder
+        // preserves canonical event kinds; Write alone does not distinguish
+        // these two streams, so their identity comes from metadata.
         let stream = reader
             .event_metadata(index)
             .ok()
@@ -6435,7 +6435,7 @@ fn read_bundle_summary(
             .and_then(|value| value.as_str())
             .unwrap_or_default();
 
-        if kind == Some("error") && schema.contains("exception_from") {
+        if kind == Some("Error") && schema.contains("exception_from") {
             exception_from_count += 1;
             exception_from_records.push(ExceptionFromSummary {
                 schema: schema.to_string(),
