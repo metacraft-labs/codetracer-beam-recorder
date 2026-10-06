@@ -214,6 +214,14 @@ jobs:
             elixir-attr: "beam.packages.erlang_27.elixir_1_17"
     steps:
       - uses: actions/checkout@v4
+      # `[self-hosted, linux, x64]` also matches garm-* ephemeral runners,
+      # whose job PATH carries no `nix` until it is provisioned ("nix: command
+      # not found" on every leg that landed there). The shared setup-nix
+      # action makes the `nix shell` below work on every runner class.
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
       - name: Build + test under OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }} (nixpkgs toolchain)
         # nixpkgs provides the whole toolchain the GitHub-hosted actions
         # (setup-beam / setup-rust-toolchain / setup-just) and apt-get used
