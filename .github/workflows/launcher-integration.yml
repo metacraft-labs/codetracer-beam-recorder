@@ -73,6 +73,14 @@ jobs:
           path: codetracer-launcher
           gh-token: ${{ steps.app-token.outputs.token }}
 
+      # Nix first: `[self-hosted, linux, x64]` can land on an ephemeral
+      # runner whose PATH does not carry `nix` until this action provisions
+      # it ("nix: command not found" on garm-* runners otherwise).
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+
       - name: Build launcher
         working-directory: codetracer-launcher
         # The launcher's build.sh cross-compiles the musl target via
