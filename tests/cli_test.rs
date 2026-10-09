@@ -1919,18 +1919,24 @@ fn e2e_runtime_records_real_exception_fixture() {
     );
 
     let reader = open_mix_trace(&recorded.out_dir);
-    let event_jsons = (0..reader.event_count())
-        .map(|index| {
-            decode_reader_event_content(&reader.event_json(index).expect("read event json"))
-        })
+    let raw_events = (0..reader.event_count())
+        .map(|index| reader.event_json(index).expect("read event json"))
         .collect::<Vec<_>>();
+    // The reader reports each event's exact `EventLogKind` by its spec name
+    // (trace-events.md §"EventLogKind (u8 enum)"); an uncaught exception is
+    // `Error` (ordinal 11).
     assert!(
-        event_jsons.iter().any(|event| {
-            event.contains("codetracer.elixir.exception_from.v1")
-                && event.contains("Elixir.CanonicalFlow")
-                && event.contains("m5 fixture exception")
+        raw_events.iter().any(|raw| {
+            let kind = serde_json::from_str::<Value>(raw)
+                .ok()
+                .and_then(|value| value.get("kind").and_then(Value::as_str).map(str::to_owned));
+            let content = decode_reader_event_content(raw);
+            kind.as_deref() == Some("Error")
+                && content.contains("codetracer.elixir.exception_from.v1")
+                && content.contains("Elixir.CanonicalFlow")
+                && content.contains("m5 fixture exception")
         }),
-        "reader should expose exception_from as Error event with schema metadata: {event_jsons:#?}"
+        "reader should expose exception_from as an `Error` event with schema metadata: {raw_events:#?}"
     );
 }
 
