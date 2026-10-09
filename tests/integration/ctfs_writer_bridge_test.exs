@@ -25,6 +25,9 @@ defmodule CodetracerBeamRecorder.CtfsWriterBridgeTest do
     assert_count_at_least(summary, "event_count", 1)
     assert_contains(summary, "first_path", "canonical_flow.ex")
     assert_contains(summary, "diagnostic_event", "ctfs writer bridge fixture")
+    # A note the recorder logs into the trace is a `TraceLogEvent`
+    # (trace-events.md §"EventLogKind (u8 enum)"), not program output.
+    assert_field(summary, "diagnostic_event_kind", "TraceLogEvent")
   end
 
   defp run_bridge!(label, bridge_args) do

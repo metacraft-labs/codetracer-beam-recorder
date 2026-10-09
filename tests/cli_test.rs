@@ -1940,6 +1940,58 @@ fn e2e_runtime_records_real_exception_fixture() {
     );
 }
 
+/// Each recorded event carries the `EventLogKind` the spec assigns to it
+/// (trace-events.md §"EventLogKind (u8 enum)"): stdout is `Write`, stderr is
+/// `WriteOther` ("a write to anything else -- stderr, a pipe, a socket"), and
+/// a message the recorder itself logs into the trace is `TraceLogEvent`.
+#[test]
+fn e2e_runtime_records_output_streams_and_diagnostics_under_their_spec_kinds() {
+    let recorded = record_elixir_expression(
+        "output-stream-kinds",
+        "CanonicalFlow.main(); IO.puts(\"beam-stdout-line\"); IO.puts(:stderr, \"beam-stderr-line\")",
+    );
+    assert_success(&recorded.output, "record stdout/stderr expression");
+
+    let reader = open_mix_trace(&recorded.out_dir);
+    let events = (0..reader.event_count())
+        .map(|index| {
+            let raw = reader.event_json(index).expect("read event json");
+            let kind = serde_json::from_str::<Value>(&raw)
+                .ok()
+                .and_then(|value| value.get("kind").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default();
+            let metadata = String::from_utf8_lossy(
+                &reader.event_metadata(index).expect("read event metadata"),
+            )
+            .into_owned();
+            (kind, metadata, decode_reader_event_content(&raw))
+        })
+        .collect::<Vec<_>>();
+    let kind_of = |metadata: &str, content: &str| {
+        events
+            .iter()
+            .filter(|(_, meta, text)| meta == metadata && text.contains(content))
+            .map(|(kind, _, _)| kind.clone())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        kind_of("stdout", "beam-stdout-line"),
+        vec!["Write".to_string()],
+        "stdout output must be recorded once as `Write`: {events:#?}"
+    );
+    assert_eq!(
+        kind_of("stderr", "beam-stderr-line"),
+        vec!["WriteOther".to_string()],
+        "stderr output must be recorded once as `WriteOther`: {events:#?}"
+    );
+    assert_eq!(
+        kind_of("m4", "runtime_session delivered="),
+        vec!["TraceLogEvent".to_string()],
+        "the recorder's own runtime-session note is a logged message, not program output: {events:#?}"
+    );
+}
+
 #[test]
 fn e2e_runtime_records_elixir_task_messages() {
     let recorded =

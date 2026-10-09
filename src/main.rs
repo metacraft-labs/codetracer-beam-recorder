@@ -410,7 +410,8 @@ fn batch_command(batch: &Path, args: &[String], envs: &[(String, String)]) -> Co
 /// The recorder forwards both streams to its own, byte for byte, so a
 /// recorded run still looks and behaves exactly like an unrecorded one —
 /// and keeps a copy, which `RecordingSession::finish` writes into the trace
-/// as `EventLogKind::Write` events. Without this the trace would describe
+/// as `EventLogKind::Write` (stdout) and `EventLogKind::WriteOther` (stderr)
+/// events. Without this the trace would describe
 /// the program's control flow but none of its OUTPUT, and "did this run
 /// really produce that line?" would be unanswerable from the trace alone.
 ///
@@ -1307,7 +1308,7 @@ impl RecordingSession {
         }
         self.write_recorded_output(recorded_output);
         self.writer.register_special_event(
-            EventLogKind::Write,
+            EventLogKind::TraceLogEvent,
             "m4",
             &format!(
                 "runtime_session delivered={} injection={}",
@@ -1328,8 +1329,10 @@ impl RecordingSession {
             .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
     }
 
-    /// Record what the program wrote, one `EventLogKind::Write` event per
-    /// line, so the trace answers "what did this run print?" on its own.
+    /// Record what the program wrote, one event per line, so the trace
+    /// answers "what did this run print?" on its own. Each stream gets the
+    /// kind trace-events.md §"EventLogKind (u8 enum)" assigns it: stdout is
+    /// `Write`, stderr is `WriteOther`. The metadata slot names the stream.
     ///
     /// The events are appended after the runtime's own trace events rather
     /// than interleaved with them: the recorder observes the child's pipes
@@ -1342,14 +1345,16 @@ impl RecordingSession {
     /// `\n` while stripping a trailing `\r`, so CRLF output loses its `\r`.
     /// The bytes forwarded to the terminal are unaffected.
     fn write_recorded_output(&mut self, output: &RecordedOutput) {
-        for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        for (stream, kind, bytes) in [
+            ("stdout", EventLogKind::Write, &output.stdout),
+            ("stderr", EventLogKind::WriteOther, &output.stderr),
+        ] {
             if bytes.is_empty() {
                 continue;
             }
             let text = String::from_utf8_lossy(bytes);
             for line in text.lines() {
-                self.writer
-                    .register_special_event(EventLogKind::Write, stream, line);
+                self.writer.register_special_event(kind, stream, line);
             }
         }
     }
@@ -5715,6 +5720,8 @@ struct FixtureSummary {
     event_count: u64,
     first_step: String,
     diagnostic_event: String,
+    /// The reader's `EventLogKind` name for `diagnostic_event`.
+    diagnostic_event_kind: String,
 }
 
 fn write_ctfs_fixture(out_dir: &Path) -> Result<FixtureSummary, Box<dyn Error>> {
@@ -5727,7 +5734,11 @@ fn write_ctfs_fixture(out_dir: &Path) -> Result<FixtureSummary, Box<dyn Error>> 
     writer.start(&source_path, Line(1));
     writer.register_step(&source_path, Line(5));
     writer.register_step(&source_path, Line(6));
-    writer.register_special_event(EventLogKind::Write, "m2", "ctfs writer bridge fixture");
+    writer.register_special_event(
+        EventLogKind::TraceLogEvent,
+        "m2",
+        "ctfs writer bridge fixture",
+    );
     writer.finish_writing_trace_events()?;
     writer.write_meta_dat("codetracer-beam-recorder")?;
     writer.close()?;
@@ -5747,6 +5758,16 @@ fn write_ctfs_fixture(out_dir: &Path) -> Result<FixtureSummary, Box<dyn Error>> 
         return Err(format!("reader saw path_count={path_count}, step_count={step_count}, event_count={event_count}").into());
     }
 
+    let diagnostic_json = reader.event_json(0)?;
+    let diagnostic_event_kind = serde_json::from_str::<serde_json::Value>(&diagnostic_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("kind")
+                .and_then(|kind| kind.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
     Ok(FixtureSummary {
         status: "ok",
         format: "ctfs",
@@ -5760,7 +5781,8 @@ fn write_ctfs_fixture(out_dir: &Path) -> Result<FixtureSummary, Box<dyn Error>> 
         step_count,
         event_count,
         first_step: reader.step_json(0)?,
-        diagnostic_event: decode_nim_event_content(&reader.event_json(0)?),
+        diagnostic_event: decode_nim_event_content(&diagnostic_json),
+        diagnostic_event_kind,
     })
 }
 
@@ -6411,9 +6433,7 @@ fn read_bundle_summary(
         };
 
         // Recorded program output. The metadata slot carries the stream name
-        // the recorder wrote it under (`stdout` / `stderr`); the event kind
-        // alone cannot tell them apart, because the recorder writes both
-        // streams as `EventLogKind::Write`.
+        // the recorder wrote it under (`stdout` / `stderr`).
         let stream = reader
             .event_metadata(index)
             .ok()
