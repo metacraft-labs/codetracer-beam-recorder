@@ -317,7 +317,7 @@ command verbatim and still propagates exit 7.
 The recorder pipes the target's stdout and stderr, forwards every byte to its
 own streams as it arrives (so a recorded run looks and behaves exactly like an
 unrecorded one), and writes a copy into the trace tagged `stdout` / `stderr`:
-stdout as `EventLogKind::Write` events and stderr as `EventLogKind::WriteOther`
+stdout as `EventLogKind::Write` events and stderr as `EventLogKind::WriteStderr`
 events, the kinds `trace-events.md` §"EventLogKind (u8 enum)" assigns them. `read-bundle-summary` surfaces them as
 `recorded_output`.
 

@@ -410,7 +410,7 @@ fn batch_command(batch: &Path, args: &[String], envs: &[(String, String)]) -> Co
 /// The recorder forwards both streams to its own, byte for byte, so a
 /// recorded run still looks and behaves exactly like an unrecorded one —
 /// and keeps a copy, which `RecordingSession::finish` writes into the trace
-/// as `EventLogKind::Write` (stdout) and `EventLogKind::WriteOther` (stderr)
+/// as `EventLogKind::Write` (stdout) and `EventLogKind::WriteStderr` (stderr)
 /// events. Without this the trace would describe
 /// the program's control flow but none of its OUTPUT, and "did this run
 /// really produce that line?" would be unanswerable from the trace alone.
@@ -1332,7 +1332,7 @@ impl RecordingSession {
     /// Record what the program wrote, one event per line, so the trace
     /// answers "what did this run print?" on its own. Each stream gets the
     /// kind trace-events.md §"EventLogKind (u8 enum)" assigns it: stdout is
-    /// `Write`, stderr is `WriteOther`. The metadata slot names the stream.
+    /// `Write`, stderr is `WriteStderr`. The metadata slot names the stream.
     ///
     /// The events are appended after the runtime's own trace events rather
     /// than interleaved with them: the recorder observes the child's pipes
@@ -1347,7 +1347,7 @@ impl RecordingSession {
     fn write_recorded_output(&mut self, output: &RecordedOutput) {
         for (stream, kind, bytes) in [
             ("stdout", EventLogKind::Write, &output.stdout),
-            ("stderr", EventLogKind::WriteOther, &output.stderr),
+            ("stderr", EventLogKind::WriteStderr, &output.stderr),
         ] {
             if bytes.is_empty() {
                 continue;

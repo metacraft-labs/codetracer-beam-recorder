@@ -1942,8 +1942,8 @@ fn e2e_runtime_records_real_exception_fixture() {
 
 /// Each recorded event carries the `EventLogKind` the spec assigns to it
 /// (trace-events.md §"EventLogKind (u8 enum)"): stdout is `Write`, stderr is
-/// `WriteOther` ("a write to anything else -- stderr, a pipe, a socket"), and
-/// a message the recorder itself logs into the trace is `TraceLogEvent`.
+/// `WriteStderr`, and a message the recorder itself logs into the trace is
+/// `TraceLogEvent`.
 #[test]
 fn e2e_runtime_records_output_streams_and_diagnostics_under_their_spec_kinds() {
     let recorded = record_elixir_expression(
@@ -1982,8 +1982,8 @@ fn e2e_runtime_records_output_streams_and_diagnostics_under_their_spec_kinds() {
     );
     assert_eq!(
         kind_of("stderr", "beam-stderr-line"),
-        vec!["WriteOther".to_string()],
-        "stderr output must be recorded once as `WriteOther`: {events:#?}"
+        vec!["WriteStderr".to_string()],
+        "stderr output must be recorded once as `WriteStderr`: {events:#?}"
     );
     assert_eq!(
         kind_of("m4", "runtime_session delivered="),
