@@ -7,10 +7,12 @@ use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus};
 
+use codetracer_ctfs::CtfsReader;
 use codetracer_trace_types::{
     EventLogKind, FieldTypeRecord, FunctionId, Line, TypeId, TypeKind, TypeSpecificInfo,
     ValueRecord,
 };
+use codetracer_trace_writer::meta_dat::{read_meta_dat_flags, FLAG_HAS_SPAN_STREAM};
 use codetracer_trace_writer_nim::{
     read_span_stream_json, NimTraceReaderHandle, NimTraceWriter, SpanRecord,
     TraceEventsFileFormat as NimFormat, SPAN_STATUS_ERROR, SPAN_STATUS_OK, SPAN_STATUS_UNKNOWN,
@@ -1378,12 +1380,14 @@ impl RecordingSession {
         let mut open_web_spans: BTreeMap<u64, OpenWebRequestSpan> = BTreeMap::new();
         let mut settled_web_spans: Vec<RecordedWebRequestSpan> = Vec::new();
         let mut thread_switch_points: Vec<(u64, u64)> = Vec::new();
+        let mut current_thread = RUNTIME_THREAD_ID;
         for event in &runtime_result.trace_events {
             match event {
                 RuntimeTraceEvent::ThreadStart { thread_id, .. } => {
                     self.writer.register_thread_start(*thread_id);
                 }
                 RuntimeTraceEvent::ThreadSwitch { thread_id, .. } => {
+                    current_thread = *thread_id;
                     thread_switch_points.push((self.writer.next_step_index(), *thread_id));
                     self.writer.register_thread_switch(*thread_id);
                 }
@@ -1446,6 +1450,20 @@ impl RecordingSession {
                             "runtime emitted step for unknown location_id {location_id}"
                         )));
                     };
+                    // Scheduler markers before the handler are not a seek
+                    // target. Bind each pending span to its first executable
+                    // source location on its own process, skipping generated
+                    // compiler scaffolding with no original-source mapping.
+                    if !location.generated
+                        && location.resolution_strategy != "unknown_generated_fallback"
+                    {
+                        for open in open_web_spans.values_mut() {
+                            if open.thread_id == current_thread && !open.has_handler_step {
+                                open.start_step = self.writer.next_step_index();
+                                open.has_handler_step = true;
+                            }
+                        }
+                    }
                     self.writer.register_step(
                         &location.resolved_source_path,
                         Line(location.resolved_line),
@@ -1552,10 +1570,8 @@ impl RecordingSession {
                     wall_ns,
                     metadata,
                 } => {
-                    // The runtime wrote a `thread_switch` for this process
-                    // immediately before this marker, so the writer's current
-                    // thread is already the request's and the next exec index
-                    // is the first event that belongs to the request.
+                    // Keep the opening boundary until the first mapped
+                    // handler step arrives on this request's own thread.
                     open_web_spans.insert(
                         *span_id,
                         OpenWebRequestSpan {
@@ -1564,6 +1580,7 @@ impl RecordingSession {
                             pid: pid.clone(),
                             start_wall_ns: *wall_ns,
                             start_step: self.writer.next_step_index(),
+                            has_handler_step: false,
                             metadata: metadata.clone(),
                         },
                     );
@@ -2036,6 +2053,7 @@ struct OpenWebRequestSpan {
     pid: String,
     start_wall_ns: u64,
     start_step: u64,
+    has_handler_step: bool,
     metadata: Vec<(String, String)>,
 }
 
@@ -2087,6 +2105,10 @@ fn web_request_metadata(
     for (key, value) in [
         ("beam.pid".to_string(), open.pid.clone()),
         ("beam.thread_id".to_string(), open.thread_id.to_string()),
+        (
+            "beam.handler_step_available".to_string(),
+            open.has_handler_step.to_string(),
+        ),
     ] {
         match metadata.iter_mut().find(|(existing, _)| *existing == key) {
             Some(slot) => slot.1 = value,
@@ -2235,6 +2257,44 @@ impl RuntimeSession {
                     .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
                 return Self::prepare_from_standalone_build(options, &build_dir);
             }
+        }
+        // A plain `record -- mix run` must use the same Elixir abstract-forms
+        // pipeline as `mix compile.codetracer`; source scanning alone gives
+        // call records but no executable handler steps to seek to.
+        if mode == RuntimeMode::Beam && target_program_name(&options.target[0]) == "mix" {
+            let build_dir = options.out_dir.join("mix_build");
+            let source_map = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("lib/codetracer_beam_recorder/elixir_source_map.ex");
+            let patterns = |values: &[String]| {
+                format!(
+                    "[{}]",
+                    values
+                        .iter()
+                        .map(|value| elixir_string(value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let expression = format!(
+                "Code.require_file({source_map}); CodetracerBeamRecorder.ElixirSourceMap.build_mix_project(build_dir: {build_dir}, include_modules: {include}, exclude_modules: {exclude})",
+                source_map = elixir_string(&source_map.display().to_string()),
+                build_dir = elixir_string(&build_dir.display().to_string()),
+                include = patterns(&options.include_modules),
+                exclude = patterns(&options.exclude_modules),
+            );
+            let output = run_beam_tool(
+                &options.target[0],
+                &["run", "--no-start", "--no-compile", "-e", &expression],
+            )
+            .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+            if !output.status.success() {
+                return Err(RecorderDiagnostic::compile_failed(format!(
+                    "Mix instrumentation failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                )));
+            }
+            return Self::prepare_from_standalone_build(options, &build_dir);
         }
         let source_paths = if mode == RuntimeMode::Beam {
             discover_source_paths(&source_root)
@@ -5860,6 +5920,8 @@ struct BundleSummary {
     workdir: String,
     path_count: u64,
     step_count: u64,
+    /// Request entry events decoded by the production CTFS reader.
+    span_entry_steps: Vec<serde_json::Value>,
     event_count: u64,
     thread_start_count_root: u64,
     thread_switch_count_root: u64,
@@ -6125,6 +6187,8 @@ fn read_bundle_summary(
     let mut thread_start_count: u64 = 0;
     let mut thread_switch_count: u64 = 0;
     let mut thread_exit_count: u64 = 0;
+    let mut step_threads = Vec::new();
+    let mut current_thread = RUNTIME_THREAD_ID;
     for index in 0..reader.step_count() {
         let step = reader.step_json(index)?;
         let is_root = step.contains("\"thread_id\":1");
@@ -6134,6 +6198,10 @@ fn read_bundle_summary(
                 thread_start_count_root += 1;
             }
         } else if step.contains("\"kind\":\"thread_switch\"") {
+            let switch: serde_json::Value = serde_json::from_str(&step)?;
+            current_thread = switch["thread_id"]
+                .as_u64()
+                .ok_or("thread switch missing thread id")?;
             thread_switch_count += 1;
             if is_root {
                 thread_switch_count_root += 1;
@@ -6144,7 +6212,34 @@ fn read_bundle_summary(
                 thread_exit_count_root += 1;
             }
         }
+        step_threads.push(current_thread);
     }
+
+    // Stream flags are presence hints: writers may stamp them only at close.
+    // Follow the production readers and recognize stream members structurally
+    // too. Any advertised or partial stream must decode strictly; only a
+    // trace with neither a flag nor any span member has no request entries.
+    let mut container = CtfsReader::open(&ct_path)?;
+    let meta = container.read_file("meta.dat")?;
+    let has_span_members = ["spans.dat", "spans.idx", "spantype.ns"]
+        .iter()
+        .any(|name| container.file_size(name).is_some());
+    let spans: Vec<serde_json::Value> =
+        if read_meta_dat_flags(&meta)? & FLAG_HAS_SPAN_STREAM != 0 || has_span_members {
+            serde_json::from_str(&read_span_stream_json(&ct_path, true)?)?
+        } else {
+            Vec::new()
+        };
+    let span_entry_steps = spans
+        .iter()
+        .map(|span| {
+            let index = span["start_step"].as_u64().ok_or("span entry missing")?;
+            let step: serde_json::Value = serde_json::from_str(&reader.step_json(index)?)?;
+            let (path, line) = reader.step_location(index)?;
+            let location = serde_json::json!({"path": reader.path(path)?, "line": line});
+            Ok(serde_json::json!({"span_id": span["span_id"], "step_index": index, "thread_id": step_threads[index as usize], "step": step, "location": location}))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
 
     let trace_meta_path = bundle_dir.join("trace_meta.json");
     let trace_meta_text = fs::read_to_string(&trace_meta_path).map_err(|error| {
@@ -6534,6 +6629,7 @@ fn read_bundle_summary(
         workdir: reader.workdir(),
         path_count: reader.path_count(),
         step_count: reader.step_count(),
+        span_entry_steps,
         event_count: reader.event_count(),
         thread_start_count_root,
         thread_switch_count_root,

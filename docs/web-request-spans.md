@@ -119,12 +119,15 @@ declared:
 
 ## Step ranges and Elixir
 
-The recorder applies step instrumentation to `.erl` sources. An Elixir
-application recorded through `mix run` reaches the container as call/return
-records in `calls.dat`, so a request's step range is made of the thread events
-that bracket it. That is a real, distinct, ordered coordinate — the panel seeks
-to it, and every request gets its own — but it does not resolve to a line of
-`router.ex`. Per-line steps for Elixir sources are a separate piece of work.
+Plain `record -- mix run` compiles and instruments the selected Mix application's
+Elixir modules through their BEAM debug information, using the same abstract-forms
+pipeline as `mix compile.codetracer`. Executable steps resolve through source maps
+to the original `.ex` files. A request's `start_step` points at its first mapped
+source step on its own BEAM process; scheduler switches and generated compiler
+scaffolding before that step are excluded from the seek target. The recorder sets
+`beam.handler_step_available=true` when that source anchor exists. If module
+filters exclude the request handlers, the metadata is `false`: the remaining
+range is a bookkeeping interval and the Request Panel refuses to seek to it.
 
 ## Reading them back
 
