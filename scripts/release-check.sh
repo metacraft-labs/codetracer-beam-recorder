@@ -19,11 +19,11 @@ set -euo pipefail
 #
 # Sibling revisions for the downstream regression set
 # (codetracer-trace-format, codetracer, codetracer-vscode-extension) are
-# resolved by CI through the repo-workspaces workspace lock
-# (scripts/resolve-sibling-rev.sh); the legacy committed sibling-pin
-# files are forbidden by the canonical repo requirements
-# (runquota/scripts/check_repo_requirements.sh) and are no longer checked
-# here.
+# the ones this commit's repro.lock pins; CI clones them through
+# metacraft-github-actions setup-dev-env / clone-siblings. The legacy
+# committed sibling-pin files are forbidden by the canonical repo
+# requirements (runquota/scripts/check_repo_requirements.sh) and are no
+# longer checked here.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -174,10 +174,9 @@ if ! echo "$cli_version_line" | grep -Fq "$cargo_version"; then
 fi
 ok "$cli_version_line"
 
-# Real downstream regression suites are run by CI through the
-# workspace-locked siblings, resolved via
-# scripts/resolve-sibling-rev.sh against the repo-workspaces workspace
-# lock. The legacy committed sibling-pin files are forbidden by the
+# Real downstream regression suites are run by CI against the siblings
+# this commit's repro.lock pins, cloned by setup-dev-env /
+# clone-siblings. The legacy committed sibling-pin files are forbidden by the
 # canonical repo requirements (runquota/scripts/check_repo_requirements.sh),
 # so release-check no longer asserts their presence.
 

@@ -23,10 +23,26 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v30
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
         with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+      # Installs Nix and clones the siblings in .github/sibling-repos
+      # (codetracer-trace-format, codetracer-trace-format-nim) to ../<name>
+      # at the revisions this commit's repro.lock pins. The crate cannot build
+      # without them (Cargo.toml path dependencies, and the Nim FFI sources
+      # codetracer_trace_writer_nim's build script compiles), and the lock is
+      # the only record of which revision this commit builds against.
+      - name: Setup dev env
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        with:
+          env-flavor: nix
+          gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
       - name: Run tests
         # The pipe used to live inside `bash -c '...'`. A bare `bash -c` has
         # neither errexit nor pipefail, so `just test | tee` took tee's exit
@@ -40,7 +56,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p logs
-          nix develop --command just test 2>&1 | tee logs/test.log
+          dev-exec just test 2>&1 | tee logs/test.log
       - name: Upload full logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -67,16 +83,27 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v30
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
         with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+      # Installs Nix and clones the lock-pinned siblings; see the `test` job.
+      - name: Setup dev env
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        with:
+          env-flavor: nix
+          gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
       - name: Run lint
         # See the note on `Run tests`: the masking pipe was inside `bash -c`.
         shell: bash
         run: |
           mkdir -p logs
-          nix develop --command just lint 2>&1 | tee logs/lint.log
+          dev-exec just lint 2>&1 | tee logs/lint.log
       - name: Upload full logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -103,18 +130,38 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v30
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
         with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+      # Installs Nix and clones the lock-pinned siblings; see the `test` job.
+      - name: Setup dev env
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        with:
+          env-flavor: nix
+          gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
       - name: Build default package
         # Here the pipe is at the step level, so `shell: bash` is enough: it
         # selects `bash --noprofile --norc -eo pipefail` instead of the default
         # `bash -e` (errexit, but NO pipefail).
+        #
+        # The overrides are what make this build the trace-format revisions
+        # repro.lock pins: setup-dev-env cloned exactly those to ../, and
+        # without the overrides the flake would fall back to the revisions
+        # flake.lock records for its own inputs, which nothing keeps in step
+        # with repro.lock.
         shell: bash
         run: |
           mkdir -p logs
-          nix build .#default --print-build-logs 2>&1 | tee logs/nix-build.log
+          nix build .#default --print-build-logs \
+            --override-input codetracer-trace-format path:../codetracer-trace-format \
+            --override-input codetracer-trace-format-nim path:../codetracer-trace-format-nim \
+            2>&1 | tee logs/nix-build.log
       - name: Upload full logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -142,16 +189,27 @@ jobs:
     needs: lint
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v30
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
         with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+      # Installs Nix and clones the lock-pinned siblings; see the `test` job.
+      - name: Setup dev env
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        with:
+          env-flavor: nix
+          gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
       - name: Run release-check
         # See the note on `Run tests`: the masking pipe was inside `bash -c`.
         shell: bash
         run: |
           mkdir -p logs
-          nix develop --command just release-check 2>&1 | tee logs/release-check.log
+          dev-exec just release-check 2>&1 | tee logs/release-check.log
       - name: Upload full logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -208,12 +266,28 @@ jobs:
             elixir: "1.16.3"
             erlang-attr: "beam.packages.erlang_26.erlang"
             elixir-attr: "beam.packages.erlang_26.elixir_1_16"
+            rebar3-attr: "beam.packages.erlang_26.rebar3"
           - otp: "27.1"
             elixir: "1.17.3"
             erlang-attr: "beam.packages.erlang_27.erlang"
             elixir-attr: "beam.packages.erlang_27.elixir_1_17"
+            rebar3-attr: "beam.packages.erlang_27.rebar3"
     steps:
       - uses: actions/checkout@v4
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+      # This leg deliberately avoids the dev shell, so it takes the siblings
+      # from clone-siblings directly rather than through setup-dev-env: the
+      # same lock-pinned revisions, to ../<name>, with no Nix env attached.
+      - name: Clone lock-pinned siblings
+        uses: metacraft-labs/metacraft-github-actions/clone-siblings@dev
+        with:
+          gh-token: ${{ steps.app-token.outputs.token }}
       # `[self-hosted, linux, x64]` also matches garm-* ephemeral runners,
       # whose job PATH carries no `nix` until it is provisioned ("nix: command
       # not found" on every leg that landed there). The shared setup-nix
@@ -227,12 +301,21 @@ jobs:
         # (setup-beam / setup-rust-toolchain / setup-just) and apt-get used
         # to install, so the leg runs on the NixOS runner. hex + rebar are
         # installed the way setup-beam did by default.
+        #
+        # nim + nimble: codetracer_trace_writer_nim's build script compiles
+        # the Nim FFI library from ../codetracer-trace-format-nim. rebar3:
+        # `just build` compiles rebar3_codetracer. Without all three `just
+        # build` saw no nimble and re-ran itself inside `nix develop`, i.e. on
+        # the dev shell's OTP rather than this leg's, and `just
+        # test-integration` could not build the crate at all.
         run: |
           nix shell \
             "nixpkgs#${{ matrix.erlang-attr }}" \
             "nixpkgs#${{ matrix.elixir-attr }}" \
+            "nixpkgs#${{ matrix.rebar3-attr }}" \
             nixpkgs#rustc nixpkgs#cargo nixpkgs#clippy nixpkgs#rustfmt \
             nixpkgs#just nixpkgs#zstd nixpkgs#capnproto nixpkgs#pkg-config \
+            nixpkgs#nim nixpkgs#nimble \
             nixpkgs#jq nixpkgs#shellcheck \
             -c bash -c '
               mix local.hex --force

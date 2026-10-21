@@ -194,6 +194,40 @@
         "type": "github"
       }
     },
+    "codetracer-trace-format": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792358159,
+        "narHash": "sha256-HkBDw/ifYxp7ipHEo0cq1OgrrtR75ECNin8QLC+8FNU=",
+        "owner": "metacraft-labs",
+        "repo": "codetracer-trace-format",
+        "rev": "afa4dde4156c168bec73711c8002418345fa249b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "ref": "agents",
+        "repo": "codetracer-trace-format",
+        "type": "github"
+      }
+    },
+    "codetracer-trace-format-nim": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792338483,
+        "narHash": "sha256-8vuc2LPXjjP0MEveNFKF/DDEjzWHFksP8jsQo48McSY=",
+        "owner": "metacraft-labs",
+        "repo": "codetracer-trace-format-nim",
+        "rev": "21defc3e03ccc5446efc275883b64121af9968ba",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "ref": "agents",
+        "repo": "codetracer-trace-format-nim",
+        "type": "github"
+      }
+    },
     "crane": {
       "locked": {
         "lastModified": 1776635034,
@@ -1105,6 +1139,38 @@
         "type": "github"
       }
     },
+    "nim-results": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792307661,
+        "narHash": "sha256-gD+5DVe1C6L0gc1geVbXZKeI/Zo4HlwFO/l1DUY31OA=",
+        "owner": "arnetheduck",
+        "repo": "nim-results",
+        "rev": "6f4e4b08901645f41eae7730b29b8c1137365eb0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "arnetheduck",
+        "repo": "nim-results",
+        "type": "github"
+      }
+    },
+    "nim-stew": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792505758,
+        "narHash": "sha256-Xyrk54e2tEnPhLvwo0o+IxE4s2skynqTp/mhTdRJ6jM=",
+        "owner": "status-im",
+        "repo": "nim-stew",
+        "rev": "168d3a2c40cf483de969fad479d8305256100aee",
+        "type": "github"
+      },
+      "original": {
+        "owner": "status-im",
+        "repo": "nim-stew",
+        "type": "github"
+      }
+    },
     "nix": {
       "inputs": {
         "flake-compat": [
@@ -1924,6 +1990,8 @@
     },
     "root": {
       "inputs": {
+        "codetracer-trace-format": "codetracer-trace-format",
+        "codetracer-trace-format-nim": "codetracer-trace-format-nim",
         "flake-parts": [
           "nixos-modules",
           "flake-parts"
@@ -1932,6 +2000,8 @@
           "nixos-modules",
           "git-hooks-nix"
         ],
+        "nim-results": "nim-results",
+        "nim-stew": "nim-stew",
         "nixos-modules": "nixos-modules",
         "nixpkgs": [
           "nixos-modules",

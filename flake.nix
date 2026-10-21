@@ -6,6 +6,41 @@
     nixpkgs.follows = "nixos-modules/nixpkgs-unstable";
     flake-parts.follows = "nixos-modules/flake-parts";
     git-hooks.follows = "nixos-modules/git-hooks-nix";
+
+    # The recorder crate path-depends on ../codetracer-trace-format (see
+    # Cargo.toml), and codetracer_trace_writer_nim's build.rs compiles the
+    # Nim FFI library from ../codetracer-trace-format-nim. Neither sibling is
+    # inside `src = ./.`, so the package build seeds both from these inputs.
+    #
+    # THE REVISION THAT COUNTS IS repro.lock's, NOT flake.lock's. CI clones
+    # each sibling at the commit this repo's repro.lock pins (clone-siblings)
+    # and builds with
+    #   --override-input codetracer-trace-format path:../codetracer-trace-format
+    #   --override-input codetracer-trace-format-nim path:../codetracer-trace-format-nim
+    # so the locked flake revisions below are only the fallback for a bare
+    # `nix build` outside the workspace. `/agents`, as in codetracer's flake:
+    # the trace format this recorder writes is integrated there and reaches
+    # `dev` with the next promotion.
+    codetracer-trace-format = {
+      url = "github:metacraft-labs/codetracer-trace-format/agents";
+      flake = false;
+    };
+    codetracer-trace-format-nim = {
+      url = "github:metacraft-labs/codetracer-trace-format-nim/agents";
+      flake = false;
+    };
+    # The Nim packages codetracer-trace-format-nim `requires` (stew,
+    # results). `nimble install` cannot reach the network inside the build
+    # sandbox, so their sources go on Nim's path directly. Same sources as
+    # codetracer-trace-format-nim's own flake.
+    nim-stew = {
+      url = "github:status-im/nim-stew";
+      flake = false;
+    };
+    nim-results = {
+      url = "github:arnetheduck/nim-results";
+      flake = false;
+    };
   };
 
   outputs =
@@ -18,9 +53,15 @@
     }:
     let
       cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+      # The sibling sources default to this flake's inputs; a consumer that
+      # has its own checkouts (or its own pins) passes them instead.
       mkBeamRecorderPackage =
         {
           pkgs,
+          codetracer-trace-format ? inputs.codetracer-trace-format,
+          codetracer-trace-format-nim ? inputs.codetracer-trace-format-nim,
+          nim-stew ? inputs.nim-stew,
+          nim-results ? inputs.nim-results,
         }:
         pkgs.rustPlatform.buildRustPackage {
           pname = "codetracer-beam-recorder";
@@ -28,8 +69,29 @@
 
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+
+          # Cargo resolves `../codetracer-trace-format/...` against the
+          # unpacked source, i.e. next to `$sourceRoot` in the build dir.
+          postUnpack = ''
+            ln -s ${codetracer-trace-format} "$sourceRoot/../codetracer-trace-format"
+          '';
+
+          # codetracer_trace_writer_nim/build.rs compiles the Nim FFI library.
+          # `nimble install --depsOnly` would need the network, so it is
+          # skipped and the `requires` packages are put on Nim's path instead.
+          CODETRACER_TRACE_FORMAT_NIM_DIR = "${codetracer-trace-format-nim}";
+          CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL = "1";
+          CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS = "${nim-stew}:${nim-results}";
+
+          # The check phase runs the unit tests only. tests/cli_test.rs drives
+          # real erlc / elixir / mix / rebar3 builds (some fetching from Hex),
+          # which the sandbox has neither the toolchain nor the network for;
+          # it runs in CI's `test` job, inside the dev shell (`just test`).
+          cargoTestFlags = [ "--bins" ];
+
           nativeBuildInputs = with pkgs; [
             capnproto
+            nim
             pkg-config
           ];
           buildInputs = with pkgs; [
@@ -162,6 +224,9 @@
                 erlang
                 just
                 jq
+                # tests/verify-ci-sibling-provisioning.sh reads the workflows
+                # (YAML) and repro.lock (TOML) with it.
+                yq-go
                 # nim + nimble are required by the
                 # ``codetracer_trace_writer_nim`` crate's build.rs --
                 # without them, ``cargo build`` aborts with::

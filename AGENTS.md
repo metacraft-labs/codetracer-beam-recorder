@@ -19,9 +19,14 @@ in later milestones.
 - `flake.nix` defines the shared Nix dev shell, package exports, and git hooks.
 - `Cargo.toml`, `Cargo.lock`, and `src/` hold the minimal recorder CLI package.
 - `.github/workflows/ci.yml` mirrors the Just targets used locally.
-- Cross-repo CI resolves public CodeTracer sibling revisions from the
-  repo-workspaces workspace lock via `scripts/resolve-sibling-rev.sh` (no
-  repo-local sibling-pins file). See
+- CI takes every sibling (`../codetracer-trace-format`,
+  `../codetracer-trace-format-nim`, the launcher, ...) at the revision this
+  commit's `repro.lock` pins, through metacraft-github-actions `setup-dev-env`
+  or `clone-siblings` and nothing else: no hand-written `git clone`, no branch
+  name, no sibling-pins file. `.github/sibling-repos` lists the siblings the
+  crate build needs; `tests/verify-ci-sibling-provisioning.sh` (run by `just
+  lint` and `just test`) enforces both. The flake's trace-format inputs are
+  only a fallback; CI overrides them with the lock-pinned clones. See
   `codetracer-specs/Testing/Cross-Repo-CI-Integration.md`.
 - `tests/verify-repo-requirements.sh` is the executable compliance harness.
 
