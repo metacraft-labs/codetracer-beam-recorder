@@ -1228,25 +1228,37 @@ end
 defmodule JasonCompat do
   @moduledoc false
 
+  # This module runs inside the TARGET project's Mix build, where the
+  # recorder cannot add dependencies, so it uses whichever JSON codec the
+  # target already has: `Jason` if the project depends on it, else OTP 27's
+  # built-in `:json`. On OTP 26 (the supported floor, see
+  # docs/known-limitations.md "M17") with no `Jason`, neither exists, and the
+  # RFC 8259 codec at the bottom of this module is used instead.
+  # https://www.rfc-editor.org/rfc/rfc8259
+
   def encode!(term), do: encode_value(term)
   def encode_pretty!(term), do: encode_value(term)
 
   def decode!(iodata) do
     binary = IO.iodata_to_binary(iodata)
 
-    case Code.ensure_loaded(Jason) do
-      {:module, Jason} ->
-        apply(Jason, :decode!, [binary])
-
-      _ ->
-        normalize_json_nulls(:json.decode(binary))
+    cond do
+      Code.ensure_loaded?(Jason) -> apply(Jason, :decode!, [binary])
+      Code.ensure_loaded?(:json) -> normalize_json_nulls(apply(:json, :decode, [binary]))
+      true -> normalize_json_nulls(fallback_decode!(binary))
     end
   end
 
   defp encode_value(term) do
-    case Code.ensure_loaded(Jason) do
-      {:module, Jason} -> apply(Jason, :encode!, [term])
-      _ -> IO.iodata_to_binary(:json.encode(string_key_maps(term)))
+    cond do
+      Code.ensure_loaded?(Jason) ->
+        apply(Jason, :encode!, [term])
+
+      Code.ensure_loaded?(:json) ->
+        IO.iodata_to_binary(apply(:json, :encode, [string_key_maps(term)]))
+
+      true ->
+        IO.iodata_to_binary(fallback_encode(string_key_maps(term)))
     end
   end
 
@@ -1276,4 +1288,246 @@ defmodule JasonCompat do
 
   defp normalize_json_nulls(list) when is_list(list), do: Enum.map(list, &normalize_json_nulls/1)
   defp normalize_json_nulls(other), do: other
+
+  # --- RFC 8259 codec for a target with neither `Jason` nor `:json`. ---
+  #
+  # Same term mapping as OTP 27's `:json`, so callers see one shape whichever
+  # codec ran: objects are maps with binary keys, `null` is `:null`, numbers
+  # are integers or floats. Public (but undocumented) so
+  # tests/integration/json_fallback_test.exs can check it against `:json`.
+  #
+  # Written as a few functions that `case` on their input rather than as many
+  # function clauses: the recorder's source scanner lists every `def` line of
+  # this file in the `-eval` argument it gives a plain `erl` target, and that
+  # one argument must stay under Linux's 128 KiB MAX_ARG_STRLEN.
+
+  @doc false
+  def fallback_encode(term) do
+    case term do
+      :null ->
+        "null"
+
+      bool when is_boolean(bool) ->
+        Atom.to_string(bool)
+
+      int when is_integer(int) ->
+        Integer.to_string(int)
+
+      # `:short` is the shortest text that reads back as the same float,
+      # which is what `:json.encode/1` emits too.
+      float when is_float(float) ->
+        :erlang.float_to_binary(float, [:short])
+
+      atom when is_atom(atom) ->
+        fallback_encode_string(Atom.to_string(atom))
+
+      binary when is_binary(binary) ->
+        fallback_encode_string(binary)
+
+      list when is_list(list) ->
+        [?[, Enum.map_intersperse(list, ?,, &fallback_encode/1), ?]]
+
+      map when is_map(map) ->
+        members =
+          Enum.map_intersperse(map, ?,, fn {key, value} ->
+            [fallback_encode_string(key_to_string(key)), ?:, fallback_encode(value)]
+          end)
+
+        [?{, members, ?}]
+
+      other ->
+        raise ArgumentError, "cannot encode #{inspect(other)} as JSON"
+    end
+  end
+
+  # `"`, `\` and the control characters U+0000..U+001F must be escaped
+  # (RFC 8259 §7); everything else is written as UTF-8.
+  defp fallback_encode_string(binary) do
+    if not String.valid?(binary) do
+      raise ArgumentError, "cannot encode #{inspect(binary)} as JSON: not valid UTF-8"
+    end
+
+    escaped =
+      Regex.replace(~r/[\x00-\x1f"\\]/, binary, fn
+        "\"" -> "\\\""
+        "\\" -> "\\\\"
+        "\n" -> "\\n"
+        "\r" -> "\\r"
+        "\t" -> "\\t"
+        "\b" -> "\\b"
+        "\f" -> "\\f"
+        <<byte>> -> "\\u" <> String.pad_leading(Integer.to_string(byte, 16), 4, "0")
+      end)
+
+    [?", escaped, ?"]
+  end
+
+  @doc false
+  def fallback_decode!(binary) when is_binary(binary) do
+    {value, rest} = json_value(binary)
+
+    case json_ws(rest) do
+      "" -> value
+      trailing -> json_error!("unexpected data after the JSON value", trailing)
+    end
+  end
+
+  defp json_ws(input) do
+    case input do
+      <<c, rest::binary>> when c in [?\s, ?\t, ?\n, ?\r] -> json_ws(rest)
+      _ -> input
+    end
+  end
+
+  defp json_value(input) do
+    case json_ws(input) do
+      <<?{, rest::binary>> ->
+        case json_ws(rest) do
+          <<?}, rest::binary>> -> {%{}, rest}
+          rest -> json_collection(rest, ?}, %{})
+        end
+
+      <<?[, rest::binary>> ->
+        case json_ws(rest) do
+          <<?], rest::binary>> -> {[], rest}
+          rest -> json_collection(rest, ?], [])
+        end
+
+      <<?", rest::binary>> ->
+        json_string(rest, [])
+
+      <<"true", rest::binary>> ->
+        {true, rest}
+
+      <<"false", rest::binary>> ->
+        {false, rest}
+
+      <<"null", rest::binary>> ->
+        {:null, rest}
+
+      other ->
+        json_number(other)
+    end
+  end
+
+  # The members of a non-empty object (`acc` is a map) or array (a list,
+  # built reversed), from after the opening bracket to after `close`.
+  defp json_collection(input, close, acc) do
+    {acc, rest} =
+      if is_map(acc) do
+        with <<?", rest::binary>> <- input,
+             {key, rest} = json_string(rest, []),
+             <<?:, rest::binary>> <- json_ws(rest) do
+          {value, rest} = json_value(rest)
+          {Map.put(acc, key, value), rest}
+        else
+          other -> json_error!("expected a \"key\": value object member", other)
+        end
+      else
+        {value, rest} = json_value(input)
+        {[value | acc], rest}
+      end
+
+    case json_ws(rest) do
+      <<?,, rest::binary>> -> json_collection(json_ws(rest), close, acc)
+      <<^close, rest::binary>> when is_list(acc) -> {Enum.reverse(acc), rest}
+      <<^close, rest::binary>> -> {acc, rest}
+      other -> json_error!("expected ',' or '#{<<close>>}'", other)
+    end
+  end
+
+  # The rest of a string after its opening quote (RFC 8259 §7).
+  defp json_string(input, acc) do
+    case input do
+      <<?", rest::binary>> ->
+        {acc |> Enum.reverse() |> IO.iodata_to_binary(), rest}
+
+      <<?\\, esc, rest::binary>> when esc in [?", ?\\, ?/] ->
+        json_string(rest, [esc | acc])
+
+      <<?\\, esc, rest::binary>> when esc in [?b, ?f, ?n, ?r, ?t] ->
+        char = %{?b => ?\b, ?f => ?\f, ?n => ?\n, ?r => ?\r, ?t => ?\t}[esc]
+        json_string(rest, [char | acc])
+
+      <<"\\u", _::binary>> ->
+        {code_point, rest} = json_code_point(input)
+        json_string(rest, [<<code_point::utf8>> | acc])
+
+      <<?\\, _::binary>> ->
+        json_error!("invalid string escape", input)
+
+      <<c, _::binary>> when c < 0x20 ->
+        json_error!("unescaped control character in a string", input)
+
+      <<c::utf8, rest::binary>> ->
+        json_string(rest, [<<c::utf8>> | acc])
+
+      _ ->
+        json_error!("invalid escape, invalid UTF-8 or unterminated string", input)
+    end
+  end
+
+  # One `\uXXXX` escape, or a UTF-16 surrogate pair of two of them for a code
+  # point beyond the BMP. A lone surrogate is not a Unicode scalar value and
+  # has no UTF-8 form, so it is rejected.
+  defp json_code_point(input) do
+    hex4 = fn hex ->
+      if hex =~ ~r/\A[0-9a-fA-F]{4}\z/, do: String.to_integer(hex, 16)
+    end
+
+    with <<"\\u", hex::binary-size(4), rest::binary>> <- input,
+         code_point when is_integer(code_point) <- hex4.(hex) do
+      cond do
+        code_point in 0xD800..0xDBFF ->
+          with <<"\\u", lo::binary-size(4), rest::binary>> <- rest,
+               low when is_integer(low) and low in 0xDC00..0xDFFF <- hex4.(lo) do
+            {0x10000 + Bitwise.bsl(code_point - 0xD800, 10) + (low - 0xDC00), rest}
+          else
+            _ -> json_error!("unpaired UTF-16 surrogate escape", input)
+          end
+
+        code_point in 0xDC00..0xDFFF ->
+          json_error!("unpaired UTF-16 surrogate escape", input)
+
+        true ->
+          {code_point, rest}
+      end
+    else
+      _ -> json_error!("invalid \\u escape", input)
+    end
+  end
+
+  # number = [ minus ] int [ frac ] [ exp ]   (RFC 8259 §6)
+  defp json_number(input) do
+    case Regex.run(~r/\A-?(?:0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/, input) do
+      nil ->
+        json_error!("expected a JSON value", input)
+
+      [text | groups] ->
+        rest = binary_part(input, byte_size(text), byte_size(input) - byte_size(text))
+
+        case groups do
+          # Neither a fraction nor an exponent matched.
+          [] ->
+            {String.to_integer(text), rest}
+
+          [fraction | _] ->
+            # Elixir's float parser wants digits on both sides of the point.
+            float_text = if fraction == "", do: String.replace(text, ~r/[eE]/, ".0e"), else: text
+
+            # Valid JSON syntax, but beyond the float range (e.g. `1e400`),
+            # which Float.parse/1 reports as :error; `:json.decode/1` rejects
+            # it too.
+            case Float.parse(float_text) do
+              {float, ""} -> {float, rest}
+              _ -> json_error!("number out of the float range", input)
+            end
+        end
+    end
+  end
+
+  defp json_error!(message, input) do
+    raise ArgumentError,
+          "invalid JSON: #{message} at #{inspect(binary_part(input, 0, min(byte_size(input), 20)))}"
+  end
 end

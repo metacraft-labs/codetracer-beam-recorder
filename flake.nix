@@ -7,6 +7,16 @@
     flake-parts.follows = "nixos-modules/flake-parts";
     git-hooks.follows = "nixos-modules/git-hooks-nix";
 
+    # The `ecosystem-matrix` CI job's OTP 26 + Elixir 1.16 leg. M17 of the
+    # BEAM recorder plan sets that pair as the supported floor, and nixpkgs
+    # removed `erlang_26` as end-of-life after its 25.11 release, so neither
+    # `nixpkgs` above nor a runner's flake registry can provide it. No output
+    # of this flake reads this input: CI resolves the leg's toolchain from it
+    # with `nix shell --inputs-from .`, which makes flake.lock the record of
+    # the OTP 26 build that leg runs.
+    # tests/verify-ecosystem-matrix-toolchains.sh evaluates every leg.
+    nixpkgs-otp26.url = "github:NixOS/nixpkgs/nixos-25.11";
+
     # The recorder crate path-depends on ../codetracer-trace-format (see
     # Cargo.toml), and codetracer_trace_writer_nim's build.rs compiles the
     # Nim FFI library from ../codetracer-trace-format-nim. Neither sibling is

@@ -406,6 +406,8 @@ package codetracer_beam_recorder:
     # the recorder was not touched — see the docstring).
     const beamIntegrationTests = [
       "ctfs_writer_bridge_test",
+      # JasonCompat's fallback JSON codec, the one OTP 26 uses (no `:json`).
+      "json_fallback_test",
       "runtime_session_test",
       "function_trace_test",
       "message_trace_test",

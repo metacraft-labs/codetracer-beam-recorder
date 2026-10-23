@@ -29,6 +29,7 @@ test-integration:
   cargo run --locked -- --version | grep -F "$(grep -E '^version = "' Cargo.toml | head -n1 | cut -d '"' -f2)"
   trace_dir="$(mktemp -d "${TMPDIR:-/tmp}/codetracer-beam-recorder-cli.XXXXXX")"; set +e; cargo run --locked -- record --out-dir "$trace_dir" -- sh -c 'exit 7'; status="$?"; set -e; rm -rf "$trace_dir"; test "$status" -eq 7
   elixir tests/integration/ctfs_writer_bridge_test.exs
+  elixir tests/integration/json_fallback_test.exs
   cargo build --locked
   elixir tests/integration/runtime_session_test.exs
   elixir tests/integration/launch_targets_test.exs
@@ -56,6 +57,13 @@ verify-trace-format-dependency:
 # revision repro.lock pins, through setup-dev-env / clone-siblings only.
 verify-ci-sibling-provisioning:
   bash tests/verify-ci-sibling-provisioning.sh
+
+# Every ecosystem-matrix leg in ci.yml evaluates, from flake.lock, to the
+# OTP/Elixir pair it names. It needs nix and the network (it evaluates the
+# locked nixpkgs), so it is neither in `just test`, whose repro.nim twin runs
+# no nix, nor in `just lint`, the pre-commit hook: CI runs it in the lint job.
+verify-ecosystem-matrix-toolchains:
+  bash tests/verify-ecosystem-matrix-toolchains.sh
 
 verify-elixir-fixture-generation-no-silent-skip:
   bash tests/verify-elixir-fixture-generation-no-silent-skip.sh
@@ -193,7 +201,7 @@ lint-rust:
   cargo clippy --locked --all-targets -- -D warnings
 
 lint-shell:
-  shellcheck tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-ci-sibling-provisioning.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/verify-beam-fixture-generation-no-silent-skip.sh tests/verify-runtime-session-test-no-silent-skip.sh tests/verify-launch-targets-test-no-silent-skip.sh tests/verify-function-trace-test-no-silent-skip.sh tests/verify-message-trace-test-no-silent-skip.sh tests/verify-manifest-source-location-test-no-silent-skip.sh tests/verify-step-instrumentation-test-no-silent-skip.sh tests/verify-native-tracer-parity-test-no-silent-skip.sh tests/verify-native-tracer-ordering-test-no-silent-skip.sh tests/verify-native-tracer-overflow-test-no-silent-skip.sh tests/verify-native-tracer-bench-test-no-silent-skip.sh tests/verify-otp-fixture-matrix-test-no-silent-skip.sh tests/verify-plug-smoke-test-no-silent-skip.sh tests/verify-plug-requests-test-no-silent-skip.sh tests/verify-phoenix-requests-test-no-silent-skip.sh tests/verify-nested-requests-test-no-silent-skip.sh tests/verify-stress-event-volume-test-no-silent-skip.sh tests/verify-release-check-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
+  shellcheck tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-ci-sibling-provisioning.sh tests/verify-ecosystem-matrix-toolchains.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/verify-beam-fixture-generation-no-silent-skip.sh tests/verify-runtime-session-test-no-silent-skip.sh tests/verify-launch-targets-test-no-silent-skip.sh tests/verify-function-trace-test-no-silent-skip.sh tests/verify-message-trace-test-no-silent-skip.sh tests/verify-manifest-source-location-test-no-silent-skip.sh tests/verify-step-instrumentation-test-no-silent-skip.sh tests/verify-native-tracer-parity-test-no-silent-skip.sh tests/verify-native-tracer-ordering-test-no-silent-skip.sh tests/verify-native-tracer-overflow-test-no-silent-skip.sh tests/verify-native-tracer-bench-test-no-silent-skip.sh tests/verify-otp-fixture-matrix-test-no-silent-skip.sh tests/verify-plug-smoke-test-no-silent-skip.sh tests/verify-plug-requests-test-no-silent-skip.sh tests/verify-phoenix-requests-test-no-silent-skip.sh tests/verify-nested-requests-test-no-silent-skip.sh tests/verify-stress-event-volume-test-no-silent-skip.sh tests/verify-release-check-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
 
 verify-repo-requirements:
   bash tests/verify-repo-requirements.sh
@@ -210,7 +218,7 @@ format-rust:
   cargo fmt
 
 format-shell:
-  shfmt -w tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-ci-sibling-provisioning.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/verify-beam-fixture-generation-no-silent-skip.sh tests/verify-runtime-session-test-no-silent-skip.sh tests/verify-launch-targets-test-no-silent-skip.sh tests/verify-function-trace-test-no-silent-skip.sh tests/verify-message-trace-test-no-silent-skip.sh tests/verify-manifest-source-location-test-no-silent-skip.sh tests/verify-step-instrumentation-test-no-silent-skip.sh tests/verify-native-tracer-parity-test-no-silent-skip.sh tests/verify-native-tracer-ordering-test-no-silent-skip.sh tests/verify-native-tracer-overflow-test-no-silent-skip.sh tests/verify-native-tracer-bench-test-no-silent-skip.sh tests/verify-otp-fixture-matrix-test-no-silent-skip.sh tests/verify-plug-smoke-test-no-silent-skip.sh tests/verify-plug-requests-test-no-silent-skip.sh tests/verify-phoenix-requests-test-no-silent-skip.sh tests/verify-nested-requests-test-no-silent-skip.sh tests/verify-stress-event-volume-test-no-silent-skip.sh tests/verify-release-check-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
+  shfmt -w tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-ci-sibling-provisioning.sh tests/verify-ecosystem-matrix-toolchains.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/verify-beam-fixture-generation-no-silent-skip.sh tests/verify-runtime-session-test-no-silent-skip.sh tests/verify-launch-targets-test-no-silent-skip.sh tests/verify-function-trace-test-no-silent-skip.sh tests/verify-message-trace-test-no-silent-skip.sh tests/verify-manifest-source-location-test-no-silent-skip.sh tests/verify-step-instrumentation-test-no-silent-skip.sh tests/verify-native-tracer-parity-test-no-silent-skip.sh tests/verify-native-tracer-ordering-test-no-silent-skip.sh tests/verify-native-tracer-overflow-test-no-silent-skip.sh tests/verify-native-tracer-bench-test-no-silent-skip.sh tests/verify-otp-fixture-matrix-test-no-silent-skip.sh tests/verify-plug-smoke-test-no-silent-skip.sh tests/verify-plug-requests-test-no-silent-skip.sh tests/verify-phoenix-requests-test-no-silent-skip.sh tests/verify-nested-requests-test-no-silent-skip.sh tests/verify-stress-event-volume-test-no-silent-skip.sh tests/verify-release-check-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
 
 test-integration-fixture:
   just test-integration

@@ -104,6 +104,15 @@ jobs:
         run: |
           mkdir -p logs
           dev-exec just lint 2>&1 | tee logs/lint.log
+      - name: Verify ecosystem-matrix toolchains
+        # Evaluates every `ecosystem-matrix` leg's toolchain from flake.lock
+        # and checks it is the OTP/Elixir the leg names, so a leg that cannot
+        # start (as OTP 26 could not once nixpkgs removed `erlang_26`) fails
+        # here with the reason instead of in a `nix shell` deep in the leg.
+        # It needs nix and the network, so it is not part of `just lint`.
+        shell: bash
+        run: |
+          dev-exec just verify-ecosystem-matrix-toolchains 2>&1 | tee logs/ecosystem-matrix-toolchains.log
       - name: Upload full logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -256,22 +265,28 @@ jobs:
       matrix:
         # Each leg pins its (OTP, Elixir) pair via nixpkgs beam package
         # sets instead of the GitHub-hosted erlef/setup-beam (which cannot
-        # run on the self-hosted NixOS eph-linux-x64 runner). Elixir
-        # versions match exactly; nixpkgs only exposes major-version
-        # erlang attrs, so OTP tracks the latest patch of that major:
+        # run on the self-hosted NixOS eph-linux-x64 runner). Each attr is
+        # `<flake input>#<attr>`, resolved through this repo's flake.lock
+        # (`--inputs-from .` below), never through the runner's registry.
+        # nixpkgs removed `erlang_26` as end-of-life after 25.11, so the
+        # OTP 26 floor comes from the `nixpkgs-otp26` input, which flake.nix
+        # pins to nixos-25.11. Elixir versions match exactly; nixpkgs only
+        # exposes major-version erlang attrs, so OTP tracks the latest patch
+        # of that major:
         #   * erlang_26 -> 26.2.5.x  (matches the intended OTP 26.2 line)
         #   * erlang_27 -> 27.3.x    (drift: intended 27.1, nearest is 27.3)
+        # tests/verify-ecosystem-matrix-toolchains.sh evaluates every leg.
         include:
           - otp: "26.2"
             elixir: "1.16.3"
-            erlang-attr: "beam.packages.erlang_26.erlang"
-            elixir-attr: "beam.packages.erlang_26.elixir_1_16"
-            rebar3-attr: "beam.packages.erlang_26.rebar3"
+            erlang-attr: "nixpkgs-otp26#beam.packages.erlang_26.erlang"
+            elixir-attr: "nixpkgs-otp26#beam.packages.erlang_26.elixir_1_16"
+            rebar3-attr: "nixpkgs-otp26#beam.packages.erlang_26.rebar3"
           - otp: "27.1"
             elixir: "1.17.3"
-            erlang-attr: "beam.packages.erlang_27.erlang"
-            elixir-attr: "beam.packages.erlang_27.elixir_1_17"
-            rebar3-attr: "beam.packages.erlang_27.rebar3"
+            erlang-attr: "nixpkgs#beam.packages.erlang_27.erlang"
+            elixir-attr: "nixpkgs#beam.packages.erlang_27.elixir_1_17"
+            rebar3-attr: "nixpkgs#beam.packages.erlang_27.rebar3"
     steps:
       - uses: actions/checkout@v4
       - name: Generate CI token
@@ -308,12 +323,22 @@ jobs:
         # build` saw no nimble and re-ran itself inside `nix develop`, i.e. on
         # the dev shell's OTP rather than this leg's, and `just
         # test-integration` could not build the crate at all.
+        #
+        # gcc: rustc links through `cc`, which `nix shell` (unlike a dev
+        # shell, whose stdenv brings one) does not provide, and a NixOS
+        # runner has none on its PATH ("error: linker `cc` not found").
+        #
+        # `--inputs-from .` makes every `<name>#` below this repo's
+        # flake.lock input of that name, so the leg builds the same toolchain
+        # on every runner. Without it `nixpkgs#` was each host's registry
+        # entry: an unpinned nixpkgs, which on 2026-10-21 no longer had
+        # `erlang_26` and stopped the OTP 26 leg at evaluation.
         run: |
-          nix shell \
-            "nixpkgs#${{ matrix.erlang-attr }}" \
-            "nixpkgs#${{ matrix.elixir-attr }}" \
-            "nixpkgs#${{ matrix.rebar3-attr }}" \
-            nixpkgs#rustc nixpkgs#cargo nixpkgs#clippy nixpkgs#rustfmt \
+          nix shell --inputs-from . \
+            "${{ matrix.erlang-attr }}" \
+            "${{ matrix.elixir-attr }}" \
+            "${{ matrix.rebar3-attr }}" \
+            nixpkgs#rustc nixpkgs#cargo nixpkgs#clippy nixpkgs#rustfmt nixpkgs#gcc \
             nixpkgs#just nixpkgs#zstd nixpkgs#capnproto nixpkgs#pkg-config \
             nixpkgs#nim nixpkgs#nimble \
             nixpkgs#jq nixpkgs#shellcheck \

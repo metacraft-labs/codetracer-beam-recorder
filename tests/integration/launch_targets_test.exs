@@ -1,4 +1,5 @@
 ExUnit.start()
+Code.require_file("support/span_stream_helpers.exs", __DIR__)
 
 defmodule CodetracerBeamRecorder.LaunchTargetsTest do
   use ExUnit.Case, async: false
@@ -501,10 +502,9 @@ defmodule CodetracerBeamRecorder.LaunchTargetsTest do
     path |> File.read!() |> decode_json!()
   end
 
-  # OTP 27+ ships `:json`, which is what the recorder's own Elixir code uses
-  # through `JasonCompat`. `null` decodes as `:null`; nothing here compares
-  # against nil, so no normalisation is needed.
-  defp decode_json!(text), do: :json.decode(text)
+  # Not `:json`: it is OTP 27+, and this suite also runs on the OTP 26 leg of
+  # the CI ecosystem matrix.
+  defp decode_json!(text), do: CodetracerBeamRecorder.SpanStreamHelpers.decode_json!(text)
 
   defp recorder_binary! do
     case System.get_env("CODETRACER_BEAM_RECORDER_BIN") do
