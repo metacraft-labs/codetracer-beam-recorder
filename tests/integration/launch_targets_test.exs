@@ -32,6 +32,10 @@ defmodule CodetracerBeamRecorder.LaunchTargetsTest do
   and no skips: a missing `elixir` / `erl` / `escript` toolchain must fail
   loudly. `tests/verify-launch-targets-test-no-silent-skip.sh` guards that.
 
+  The large-options regressions also drive all five BEAM launch commands with
+  a generated 500-function module, consult the complete options file, and read
+  back the final function call and stdout. No launcher or compiler is mocked.
+
   Design: docs/launch-targets.md.
   """
 
@@ -48,7 +52,7 @@ defmodule CodetracerBeamRecorder.LaunchTargetsTest do
   @erlang_source_dir Path.join(@repo_root, "test-programs/erlang/escript_program")
 
   setup_all do
-    require_toolchain!(["elixir", "elixirc", "erl", "erlc", "escript"])
+    require_toolchain!(["elixir", "elixirc", "erl", "erlc", "escript", "mix", "rebar3"])
     :ok
   end
 
@@ -176,6 +180,108 @@ defmodule CodetracerBeamRecorder.LaunchTargetsTest do
 
     assert "escript-program: describe=escript-launch-target" in recorded,
            "the recorded trace must contain the program's stdout; got #{inspect(recorded)}"
+  end
+
+  # Real filesystem/compiler/VM/CTFS boundaries, without mocks: every wrapper
+  # sees 500 traceable functions, exceeding Linux's 128 KiB argument limit.
+  # Calling the last function rejects a fix that truncates the option list.
+  for launcher <- ["erl", "escript", "rebar3", "elixir", "mix"] do
+    @launcher launcher
+    @tag timeout: :infinity, large_options: true
+    test "#{launcher}_launches_with_runtime_options_over_128_kib" do
+      launcher = @launcher
+      root = tmp_dir!("large-options-#{launcher}")
+      on_exit(fn -> File.rm_rf!(root) end)
+      src = Path.join(root, if(launcher == "mix", do: "lib", else: "src"))
+      File.mkdir_p!(src)
+      out = Path.join(root, "out")
+
+      {function_name, target} =
+        if launcher in ["elixir", "mix"] do
+          program = Path.join(src, "large_options.ex")
+          functions = Enum.map_join(1..500, "\n", &"  def value_#{&1}(), do: #{&1}")
+
+          File.write!(program, """
+          defmodule LargeOptions do
+            # Generated __struct__ functions must remain atoms in the term file.
+            defstruct [:value]
+          #{functions}
+            def main(), do: IO.puts("large-options=\#{value_500()}")
+          end
+          #{if launcher == "elixir", do: "LargeOptions.main()"}
+          """)
+
+          File.write!(Path.join(root, "mix.exs"), """
+          defmodule LargeOptions.MixProject do
+            use Mix.Project
+            def project(), do: [app: :large_options, version: "0.1.0"]
+          end
+          """)
+
+          target =
+            if launcher == "mix",
+              do: ["mix", "run", "--no-compile", "-e", "LargeOptions.main()"],
+              else: ["elixir", program]
+
+          {"LargeOptions.value_500/0", target}
+        else
+          program = Path.join(src, "large_options.erl")
+          exports = Enum.map_join(1..500, ",", &"value_#{&1}/0")
+          functions = Enum.map_join(1..500, "\n", &"value_#{&1}() -> #{&1}.")
+
+          File.write!(program, """
+          -module(large_options).
+          -export([main/0, main/1, #{exports}]).
+          #{functions}
+          main(_Args) -> main().
+          main() -> io:format("large-options=~p~n", [value_500()]).
+          """)
+
+          File.write!(Path.join(root, "rebar.config"), "{erl_opts, [debug_info]}.\n")
+
+          target =
+            case launcher do
+              "erl" -> ["erl", "-noshell", "-s", "large_options", "main", "-s", "init", "stop"]
+              "escript" -> ["escript", program]
+              "rebar3" -> ["rebar3", "shell", "--eval", "large_options:main()."]
+            end
+
+          {"large_options:value_500/0", target}
+        end
+
+      source_args =
+        if launcher == "mix" do
+          {compile_output, compile_status} =
+            System.cmd("mix", ["compile", "--warnings-as-errors"], cd: root, stderr_to_stdout: true)
+
+          assert compile_status == 0, "large Mix fixture must compile: #{compile_output}"
+          []
+        else
+          ["--source-dir", src]
+        end
+
+      {output, status} = record!(root, ["--out-dir", out] ++ source_args ++ ["--" | target])
+      assert status == 0, "#{launcher} must launch with large runtime options:\n#{output}"
+
+      options_file = Path.join(out, "runtime_options.term")
+      assert File.stat!(options_file).size > 131_072,
+             "the fixture must exceed Linux's per-argument limit"
+
+      {:ok, [options]} = :file.consult(String.to_charlist(options_file))
+      assert length(Keyword.fetch!(options, :trace_functions)) >= 501
+      summary = read_bundle_summary!(out)
+      assert summary["runtime_session_delivered"] == true
+      recorded_calls =
+        Enum.map(summary["call_function_ids"], &Enum.fetch!(summary["function_names"], &1))
+
+      assert function_name in recorded_calls,
+             "the last function must have a decoded call record; got #{inspect(recorded_calls)}"
+
+      assert summary["sidecar_call_count"] >= 2
+      assert summary["step_count"] > 0
+      # rebar3's real interactive shell prefixes its first output with `1>`.
+      assert Enum.any?(recorded_output(summary), &Regex.match?(~r/^(?:[0-9]+> )?large-options=500$/, &1))
+    end
   end
 
   # ------------------------------------------------------------------

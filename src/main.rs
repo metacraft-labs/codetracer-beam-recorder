@@ -2462,6 +2462,20 @@ impl RuntimeSession {
                 "missing compiled runtime ebin directory",
             ));
         };
+        // Keep configuration out of argv: the function/source/manifest lists
+        // can exceed Linux's per-argument limit even for ordinary projects.
+        // Both Erlang and Elixir consult this same complete Erlang term.
+        let options_path = self.runtime_options_path();
+        fs::write(
+            &options_path,
+            format!("{}.\n", erlang_runtime_options(self)),
+        )
+        .map_err(|error| {
+            RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                "failed to write runtime options at {}: {error}",
+                options_path.display()
+            ))
+        })?;
         let command_name = target_program_name(&target[0]);
         let mut prepared = match command_name.as_str() {
             "mix" => self.prepare_mix_target(target, runtime_ebin),
@@ -2477,6 +2491,10 @@ impl RuntimeSession {
         }?;
         prepared.env.extend(value_limit_env(&options.value_limits));
         Ok(prepared)
+    }
+
+    fn runtime_options_path(&self) -> PathBuf {
+        self.session_file.with_file_name("runtime_options.term")
     }
 
     fn prepare_mix_target(
@@ -5227,11 +5245,11 @@ fn wrap_elixir_expression(expression: &str, runtime: &RuntimeSession) -> String 
     // of quoting. `;` is an equivalent Elixir statement separator and
     // `try do … after … end` is valid inline.
     format!(
-        ":code.add_patha({runtime_ebin}); {instrumented_path}{purge_modules}:ok = :codetracer_erlang_runtime.start_session({options}); try do {expression} after :ok = :codetracer_erlang_runtime.stop_session(:normal) end",
+        ":code.add_patha({runtime_ebin}); {instrumented_path}{{:ok, [ct_runtime_options]}} = :file.consult({options_path}); {purge_modules}:ok = :codetracer_erlang_runtime.start_session(ct_runtime_options); try do {expression} after :ok = :codetracer_erlang_runtime.stop_session(:normal) end",
         runtime_ebin = runtime_ebin,
         instrumented_path = instrumented_path,
-        purge_modules = elixir_purge_trace_modules(&runtime.trace_functions),
-        options = elixir_runtime_options(runtime)
+        purge_modules = "ct_runtime_options |> Keyword.fetch!(:trace_functions) |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> Enum.each(fn ct_module -> :code.purge(ct_module); :code.delete(ct_module) end); ",
+        options_path = elixir_charlist(&runtime.runtime_options_path().display().to_string())
     )
 }
 
@@ -5247,8 +5265,8 @@ fn wrap_erlang_entrypoint(
     runtime: &RuntimeSession,
 ) -> String {
     format!(
-        "codetracer_erlang_runtime:start_session({options}), try apply({module}, {function}, {args}) of _ -> codetracer_erlang_runtime:stop_session(normal), halt(0) catch Class:Reason:Stack -> codetracer_erlang_runtime:stop_session({{Class,Reason}}), erlang:raise(Class, Reason, Stack) end.",
-        options = erlang_runtime_options(runtime),
+        "{{ok,[CTRuntimeOptions]}} = file:consult({options_path}), codetracer_erlang_runtime:start_session(CTRuntimeOptions), try apply({module}, {function}, {args}) of _ -> codetracer_erlang_runtime:stop_session(normal), halt(0) catch Class:Reason:Stack -> codetracer_erlang_runtime:stop_session({{Class,Reason}}), erlang:raise(Class, Reason, Stack) end.",
+        options_path = erlang_string(&runtime.runtime_options_path().display().to_string()),
         module = erlang_atom(module),
         function = erlang_atom(function),
         args = args_literal
@@ -5266,18 +5284,18 @@ fn wrap_rebar3_shell_eval(expression: &str, runtime: &RuntimeSession) -> String 
         .as_ref()
         .map(|path| {
             format!(
-                "code:add_patha({}),{}",
-                erlang_string(&path.display().to_string()),
-                erlang_purge_trace_modules(&runtime.trace_functions)
+                "code:add_patha({}),",
+                erlang_string(&path.display().to_string())
             )
         })
         .unwrap_or_default();
     let expression = erlang_eval_expression_body(expression);
     format!(
-        "code:add_patha({runtime_ebin}),{instrumented_path}codetracer_erlang_runtime:start_session({options}), try begin {expression} end of _ -> codetracer_erlang_runtime:stop_session(normal), halt(0) catch Class:Reason:Stack -> codetracer_erlang_runtime:stop_session({{Class,Reason}}), erlang:raise(Class, Reason, Stack) end.",
+        "code:add_patha({runtime_ebin}),{instrumented_path}{{ok,[CTRuntimeOptions]}} = file:consult({options_path}), {purge_modules}codetracer_erlang_runtime:start_session(CTRuntimeOptions), try begin {expression} end of _ -> codetracer_erlang_runtime:stop_session(normal), halt(0) catch Class:Reason:Stack -> codetracer_erlang_runtime:stop_session({{Class,Reason}}), erlang:raise(Class, Reason, Stack) end.",
         runtime_ebin = runtime_ebin,
         instrumented_path = instrumented_path,
-        options = erlang_runtime_options(runtime),
+        purge_modules = "lists:foreach(fun(CTModule) -> code:purge(CTModule), code:delete(CTModule) end, lists:usort([element(1, CTFun) || CTFun <- proplists:get_value(trace_functions, CTRuntimeOptions, [])])),",
+        options_path = erlang_string(&runtime.runtime_options_path().display().to_string()),
         expression = expression
     )
 }
@@ -5289,35 +5307,6 @@ fn erlang_eval_expression_body(expression: &str) -> String {
         .unwrap_or_else(|| expression.trim())
         .trim()
         .to_string()
-}
-
-fn elixir_runtime_options(runtime: &RuntimeSession) -> String {
-    let mut extras = String::new();
-    extras.push_str(&format!(
-        ", {{:tracer_backend, :{}}}",
-        runtime.tracer_backend.as_str()
-    ));
-    if let Some(limit) = runtime.tracer_queue_limit {
-        extras.push_str(&format!(", {{:queue_limit, {limit}}}"));
-    }
-    if let Some(policy) = runtime.tracer_overflow_policy {
-        extras.push_str(&format!(", {{:overflow_policy, :{}}}", policy.as_str()));
-    }
-    format!(
-        "[{{:session_file, {session_file}}}, {{:source_paths, {source_paths}}}, {{:manifest_paths, {manifest_paths}}}, {{:trace_functions, {trace_functions}}}, {{:capture_messages, {capture_messages}}}{extras}]",
-        session_file = elixir_charlist(&runtime.session_file.display().to_string()),
-        source_paths = elixir_charlist_list(&runtime.source_paths),
-        manifest_paths = elixir_string_list(
-            &runtime
-                .manifests
-                .iter()
-                .map(|manifest| manifest.runtime_path.clone())
-                .collect::<Vec<_>>()
-        ),
-        trace_functions = elixir_trace_function_list(&runtime.trace_functions),
-        capture_messages = runtime.capture_messages,
-        extras = extras
-    )
 }
 
 fn erlang_runtime_options(runtime: &RuntimeSession) -> String {
@@ -5349,52 +5338,6 @@ fn erlang_runtime_options(runtime: &RuntimeSession) -> String {
     )
 }
 
-fn elixir_charlist_list(paths: &[PathBuf]) -> String {
-    let values = paths
-        .iter()
-        .map(|path| elixir_charlist(&path.display().to_string()))
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(", "))
-}
-
-fn elixir_purge_trace_modules(functions: &[TraceFunctionSpec]) -> String {
-    let modules = functions
-        .iter()
-        .map(|function| function.module.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    modules
-        .iter()
-        .map(|module| {
-            // `;` statement separators (not newlines) so the whole wrapped
-            // expression stays on a single line — required for it to
-            // survive a `cmd /c` invocation on Windows, where a newline
-            // terminates the command regardless of quoting.
-            format!(
-                ":code.purge({module}); :code.delete({module}); ",
-                module = elixir_atom(module)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn erlang_purge_trace_modules(functions: &[TraceFunctionSpec]) -> String {
-    let modules = functions
-        .iter()
-        .map(|function| function.module.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    modules
-        .iter()
-        .map(|module| {
-            format!(
-                "code:purge({module}),code:delete({module}),",
-                module = erlang_atom(module)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
 fn erlang_string_list(paths: &[PathBuf]) -> String {
     let values = paths
         .iter()
@@ -5403,48 +5346,12 @@ fn erlang_string_list(paths: &[PathBuf]) -> String {
     format!("[{}]", values.join(","))
 }
 
-fn elixir_string_list(values: &[String]) -> String {
-    let values = values
-        .iter()
-        .map(|value| elixir_charlist(value))
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(", "))
-}
-
 fn erlang_string_vec(values: &[String]) -> String {
     let values = values
         .iter()
         .map(|value| erlang_string(value))
         .collect::<Vec<_>>();
     format!("[{}]", values.join(","))
-}
-
-fn elixir_trace_function_list(functions: &[TraceFunctionSpec]) -> String {
-    let values = functions
-        .iter()
-        .map(|function| {
-            format!(
-                "{{{module}, {name}, {arity}, {kind}, {source_path}, {line}, {manifest_id}, {function_key}, {location_id}, {clause_id}, {resolved_source_path}, {resolved_line}, {resolved_column}, {resolution_strategy}, {trace_copy_path}}}",
-                module = elixir_atom(&function.module),
-                name = elixir_atom(&function.function),
-                arity = function.arity,
-                kind = elixir_charlist(&function.kind),
-                source_path = elixir_charlist(&function.source_path.display().to_string()),
-                line = function.line,
-                manifest_id = elixir_charlist(&function.manifest_id),
-                function_key = elixir_charlist(&function.function_key),
-                location_id = function.location_id,
-                clause_id = function.clause_id,
-                resolved_source_path =
-                    elixir_charlist(&function.resolved_source_path.display().to_string()),
-                resolved_line = function.resolved_line,
-                resolved_column = optional_u32_elixir(function.resolved_column),
-                resolution_strategy = elixir_charlist(&function.resolution_strategy),
-                trace_copy_path = elixir_charlist(&function.trace_copy_path)
-            )
-        })
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(", "))
 }
 
 fn erlang_trace_function_list(functions: &[TraceFunctionSpec]) -> String {
@@ -5474,12 +5381,6 @@ fn erlang_trace_function_list(functions: &[TraceFunctionSpec]) -> String {
     format!("[{}]", values.join(","))
 }
 
-fn optional_u32_elixir(value: Option<u32>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "nil".to_string())
-}
-
 fn optional_u32_erlang(value: Option<u32>) -> String {
     value
         .map(|value| value.to_string())
@@ -5496,30 +5397,15 @@ fn elixir_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn elixir_atom(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-    {
-        format!(":{value}")
-    } else {
-        format!(":\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    }
-}
-
 fn erlang_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn erlang_atom(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
-    }
+    // Elixir-generated names such as __info__ start with an underscore,
+    // which Erlang parses as a variable. Quoting also handles reserved words
+    // and operator names without maintaining a second Erlang lexer here.
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 fn extract_erl_start_function(args: &mut Vec<String>) -> Option<(String, String)> {
@@ -6697,6 +6583,91 @@ mod tests {
         RuntimeCompiler, RUNTIME_APP_NAME,
     };
     use std::{fs, io};
+
+    // Only wrapper generation is under test here; RuntimeSession::prepare uses
+    // a non-BEAM command so no compiler/launcher is substituted or mocked.
+    fn wrapper_test_session(out_dir: &std::path::Path) -> super::RuntimeSession {
+        let args = vec![
+            "--out-dir".into(),
+            out_dir.display().to_string(),
+            "--".into(),
+            "sh".into(),
+        ];
+        let ParsedRecordCommand::Record(options) = parse_record_options(args).unwrap() else {
+            panic!("expected record options");
+        };
+        let mut runtime = super::RuntimeSession::prepare(&options).unwrap();
+        runtime.mode = super::RuntimeMode::Beam;
+        runtime.runtime_ebin = Some(out_dir.join("runtime_ebin"));
+        runtime.instrumented_ebin = Some(out_dir.join("instrumented_ebin"));
+        runtime
+    }
+
+    #[test]
+    fn runtime_wrapper_size_does_not_grow_with_functions_or_modules() {
+        let mut runtime = wrapper_test_session(std::path::Path::new("/tmp/wrapper-options"));
+        let wrappers = |runtime: &super::RuntimeSession| {
+            [
+                super::wrap_elixir_expression("Example.main()", runtime),
+                super::wrap_erlang_entrypoint("example", "main", "[]", runtime),
+                super::wrap_rebar3_shell_eval("example:main().", runtime),
+            ]
+        };
+        let initial_lengths = wrappers(&runtime).map(|wrapper| wrapper.len());
+        for index in 0..1000 {
+            runtime
+                .trace_functions
+                .push(super::trace_function_spec(super::TraceFunctionInput {
+                    source_root: std::path::Path::new("/tmp"),
+                    source_maps: &[],
+                    module: &format!("module_{index}"),
+                    function: "main",
+                    arity: 0,
+                    kind: "erlang",
+                    source_path: std::path::Path::new("/tmp/project/src/example.erl"),
+                    line: 1,
+                }));
+        }
+        assert!(super::erlang_runtime_options(&runtime).len() > 131_072);
+        assert_eq!(
+            wrappers(&runtime).map(|wrapper| wrapper.len()),
+            initial_lengths
+        );
+    }
+
+    #[test]
+    fn runtime_options_are_written_completely_and_write_errors_are_bootstrap_errors() {
+        let out_dir = std::env::temp_dir().join(format!(
+            "beam-runtime-options-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&out_dir).unwrap();
+        let runtime = wrapper_test_session(&out_dir);
+        let args = ["--", "mix", "run", "-e", "IO.puts(:ok)"].map(String::from);
+        let ParsedRecordCommand::Record(options) = parse_record_options(args.to_vec()).unwrap()
+        else {
+            panic!("expected record options");
+        };
+        runtime.prepare_target(&options).unwrap();
+        let options_path = runtime.runtime_options_path();
+        assert_eq!(
+            fs::read_to_string(&options_path).unwrap(),
+            format!("{}.\n", super::erlang_runtime_options(&runtime))
+        );
+        fs::remove_file(&options_path).unwrap();
+        fs::create_dir(&options_path).unwrap();
+        let error = runtime.prepare_target(&options).unwrap_err();
+        assert_eq!(error.code, "runtime_bootstrap_failed");
+        assert!(error
+            .detail
+            .unwrap()
+            .contains(&options_path.display().to_string()));
+        fs::remove_dir_all(out_dir).unwrap();
+    }
 
     /// The five launch commands this recorder claims to instrument, and the
     /// source language each one implies. `elixir` and `escript` are the two
