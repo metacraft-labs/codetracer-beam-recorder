@@ -6,7 +6,7 @@
 -export([start/2, stop/1]).
 -export([start_session/1, step/1, bind_many/1, stop_session/1]).
 -export([web_request_start/1, web_request_stop/2]).
--export([recorder_traffic/1]).
+-export([recorder_traffic/1, message_repr/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -record(state, {
@@ -1141,7 +1141,7 @@ write_message_event(
     RecipientThreadId,
     Message
 ) ->
-    {MessageRepr, MessageTruncated} = bounded_term(Message, 512),
+    {MessageRepr, MessageTruncated} = message_repr(Message, 512),
     Line = [
         "{\"event\":\"", Event, "\",",
         "\"schema\":\"codetracer.beam.message.v1\",",
@@ -1191,14 +1191,80 @@ tag_text(Value) when is_pid(Value) ->
 tag_text(_Value) ->
     "term".
 
-bounded_term(Value, Limit) ->
-    Text = lists:flatten(io_lib:format("~0tp", [Value])),
+%% The `message_repr' of a traced message: its text, cut at Limit characters,
+%% and whether it was cut. codetracer_native_tracer calls it too, so both
+%% tracer backends render a message the same way.
+message_repr(Message, Limit) ->
+    Text = lists:flatten(message_text(Message)),
     case length(Text) > Limit of
         true ->
             {string:substr(Text, 1, Limit), true};
         false ->
             {Text, false}
     end.
+
+%% A message's text is `~0tp' of the term, except inside an io request
+%% (https://www.erlang.org/doc/apps/stdlib/io_protocol.html): there the
+%% `Args' of a `put_chars' request that names a function are an argument
+%% list, never text, so they are written element by element. `~p' over the
+%% whole request takes a list of printable integers for a string, and prints
+%% the request `io:format("~p~n", [94])' sends as `["~p~n","^"]', turning the
+%% argument 94 into the character `^'. Every other request, and every other
+%% message, is `~0tp' of the whole term.
+message_text({io_request, From, ReplyAs, Request}) ->
+    ["{io_request,", term_text(From), ",", term_text(ReplyAs), ",",
+     io_request_text(Request), "}"];
+message_text(Message) ->
+    term_text(Message).
+
+io_request_text({put_chars, Encoding, Module, Function, Args}) ->
+    ["{put_chars,", term_text(Encoding), ",", term_text(Module), ",",
+     term_text(Function), ",", call_args_text(Module, Function, Args), "}"];
+%% The form without an encoding, which the protocol still defines.
+io_request_text({put_chars, Module, Function, Args}) ->
+    ["{put_chars,", term_text(Module), ",", term_text(Function), ",",
+     call_args_text(Module, Function, Args), "}"];
+io_request_text({requests, Requests}) when is_list(Requests) ->
+    case is_proper_list(Requests) of
+        true ->
+            ["{requests,[", lists:join(",", [io_request_text(R) || R <- Requests]), "]}"];
+        false ->
+            term_text({requests, Requests})
+    end;
+io_request_text(Request) ->
+    term_text(Request).
+
+%% `Args' are the arguments of the call Module:Function(...), so they are
+%% written as a list whatever their elements are. In the call io:format and
+%% io:fwrite request, `io_lib:format(Format, Arguments)', the second argument
+%% is the format's argument vector, a list as well, so it is written element
+%% by element too. Every argument, and every element of that vector, is
+%% `~0tp' of itself, as the program's own `~p' would print it. The arguments
+%% of any other function are not reinterpreted: what a list means to that
+%% function is not known here.
+call_args_text(io_lib, Function, [Format, Arguments])
+  when (Function =:= format orelse Function =:= fwrite), is_list(Arguments) ->
+    case is_proper_list(Arguments) of
+        true -> ["[", term_text(Format), ",", list_text(Arguments), "]"];
+        false -> list_text([Format, Arguments])
+    end;
+call_args_text(_Module, _Function, Args) when is_list(Args) ->
+    case is_proper_list(Args) of
+        true -> list_text(Args);
+        false -> term_text(Args)
+    end;
+call_args_text(_Module, _Function, Args) ->
+    term_text(Args).
+
+list_text(Elements) ->
+    ["[", lists:join(",", [term_text(Element) || Element <- Elements]), "]"].
+
+is_proper_list([]) -> true;
+is_proper_list([_ | Tail]) -> is_proper_list(Tail);
+is_proper_list(_) -> false.
+
+term_text(Value) ->
+    io_lib:format("~0tp", [Value]).
 
 join_json_strings([]) ->
     "";

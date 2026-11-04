@@ -579,7 +579,7 @@ write_thread_event(File, Event, ThreadId, RootPid, SourcePaths, Seq) ->
 
 write_message_event(File, Event, TraceTag, SenderPid, SenderThreadId,
                     RecipientPid, RecipientThreadId, Message, Seq) ->
-    {MessageRepr, MessageTruncated} = bounded_term(Message, 512),
+    {MessageRepr, MessageTruncated} = codetracer_session:message_repr(Message, 512),
     Line = [
         "{\"event\":\"", Event, "\",",
         "\"backend\":\"native\",",
@@ -618,13 +618,6 @@ tag_text(Value) when is_list(Value) -> "list";
 tag_text(Value) when is_tuple(Value) -> "tuple";
 tag_text(Value) when is_pid(Value) -> "pid";
 tag_text(_Value) -> "term".
-
-bounded_term(Value, Limit) ->
-    Text = lists:flatten(io_lib:format("~0tp", [Value])),
-    case length(Text) > Limit of
-        true -> {string:substr(Text, 1, Limit), true};
-        false -> {Text, false}
-    end.
 
 source_metadata_json(Metadata) ->
     SourceLocation = maps:get(source_location, Metadata),
