@@ -184,17 +184,37 @@ package codetracer_beam_recorder:
     "pkg-config"
     "zstd"
 
+    # nimble resolves the Nim FFI's requirements through git.
+    "git"
+
     # POSIX shell — drives the golden-contract verification edge below,
     # the same ``bash tests/verify-golden-contract.sh`` step ``just test``
-    # runs (as ``test-goldens``) alongside ``cargo test``.
+    # runs (as ``test-goldens``) alongside ``cargo test``. Every shell
+    # edge runs its script with ``bash``; the scripts call the text and
+    # file tools listed after it, and the golden-contract script reads the
+    # fixtures with ``jq``.
     "sh"
+    "bash"
+    "jq"
+    "grep"
+    "sed"
+    "awk"
+    "cut"
+    "head"
+    "tail"
+    "cat"
+    "mkdir"
+    "mktemp"
+    "dirname"
+    "rm"
 
     # NB: the BEAM/OTP runtime (``erl`` / ``erlc`` / ``elixir`` / ``mix``
-    # / ``rebar3``) and ``jq`` are NOT declared here. Reprobuild resolves
-    # a ``uses:`` selector to a PATH binary of the SAME name; the OTP
-    # tools ship binaries named ``erl`` / ``elixir`` / … (there is no
-    # ``erlang`` binary), and reprobuild has no BEAM tool-edge to drive
-    # them through, so declaring them would only add a failing PATH probe.
+    # / ``rebar3``) is NOT declared here. The standard library's
+    # ``erlang`` and ``elixir`` packages provision Windows archives only,
+    # ``erlang`` maps to no ``erl`` executable (a PATH probe looks for an
+    # ``erlang`` binary, which OTP does not ship), and there is no
+    # ``mix`` / ``erlc`` / ``escript`` / ``rebar3`` package at all, so
+    # declaring them would only add a failing PATH probe.
     # These tools are runtime dependencies of the spawned cargo test
     # process (``tests/cli_test.rs`` ``e2e_*`` compile+record real Erlang
     # and Elixir programs), of the golden-contract shell script, and of
@@ -522,8 +542,9 @@ package codetracer_beam_recorder:
       "stress-event-volume-test",
       "release-check"
     ]
+    var gateEdges: seq[BuildActionDef] = @[]
     for g in beamNoSilentSkipGates:
-      beamEdges.add shell(
+      gateEdges.add shell(
         command = "bash tests/verify-" & g & "-no-silent-skip.sh",
         actionId = "codetracer-beam-recorder.verify-" & g & "-no-silent-skip",
         extraInputs = @[
@@ -531,4 +552,38 @@ package codetracer_beam_recorder:
           "tests/integration", "tests/fixtures", "scripts",
           "test-programs", "repro.nim", "Justfile"])
 
-    discard collect("test", @[testsRun.action, goldenVerify] & beamEdges)
+    # ---- Tool identities --------------------------------------------
+    #
+    # A typed-tool wrapper attaches only its own tool's identity to the
+    # action it registers, and ``sh.shell`` / ``pooledShell`` attach none,
+    # so every tool an edge's process tree runs is attached here, from the
+    # ``uses:`` declarations above. Without them the tools' versions never
+    # reach the actions' cache keys, and under typed provisioning the tools
+    # are not on the actions' PATH at all.
+    #
+    # Attaching an identity also narrows the action's PATH to the attached
+    # tools. That is why the edges that run the BEAM toolchain -- the cargo
+    # test run (``tests/cli_test.rs`` compiles and records real Erlang and
+    # Elixir programs), the two canonical-flow fixtures and the live-BEAM
+    # integration suites -- carry none yet: ``erl`` / ``erlc`` / ``elixir``
+    # / ``mix`` / ``rebar3`` cannot be declared (see the note at the end of
+    # ``uses:``), so those edges still take every tool from the dev-shell
+    # PATH, and attaching only the declarable ones would hide the BEAM
+    # toolchain from them.
+    const cargoToolRefs = ["cargo", "rustc", "nim", "nimble", "git", "capnp",
+                           "pkg-config", "zstd"]
+    const shellToolRefs = ["sh", "bash", "grep", "sed", "awk", "cut", "head",
+                           "tail", "cat", "mkdir", "mktemp", "dirname", "rm"]
+    for action in [recorderBuild.id, recorderDebugBuild.id,
+                   testsBuild.action.id]:
+      appendRegisteredActionToolIdentityRefs(action, cargoToolRefs)
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(action, ["gcc"])
+      elif defined(macosx):
+        appendRegisteredActionToolIdentityRefs(action, ["clang"])
+    for action in @[goldenVerify, cliSmoke] & gateEdges:
+      appendRegisteredActionToolIdentityRefs(action.id, shellToolRefs)
+    appendRegisteredActionToolIdentityRefs(goldenVerify.id, ["jq"])
+
+    discard collect("test",
+      @[testsRun.action, goldenVerify] & beamEdges & gateEdges)
