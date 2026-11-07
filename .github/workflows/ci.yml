@@ -265,7 +265,7 @@ jobs:
       matrix:
         # Each leg pins its (OTP, Elixir) pair via nixpkgs beam package
         # sets instead of the GitHub-hosted erlef/setup-beam (which cannot
-        # run on the self-hosted NixOS eph-linux-x64 runner). Each attr is
+        # run on the self-hosted NixOS `[self-hosted, linux, x64]` runners). Each attr is
         # `<flake input>#<attr>`, resolved through this repo's flake.lock
         # (`--inputs-from .` below), never through the runner's registry.
         # nixpkgs removed `erlang_26` as end-of-life after 25.11, so the

@@ -23,8 +23,8 @@ name: launcher-integration
 
 # Single-edge cross-repo CI: when codetracer-beam-recorder changes,
 # verify the launcher's bundled-hex build still works against this
-# recorder's source. Mirrors the pattern in
-# codetracer-specs/Testing/Cross-Repo-CI-Integration.md.
+# recorder's source. Same single-edge pattern as the other recorders'
+# cross-repo workflows.
 #
 # Added as part of the M9 extension that brought BEAM / Hex.pm into
 # the campaign's package-manager matrix alongside the original
@@ -88,7 +88,7 @@ jobs:
         # The launcher's build.sh cross-compiles the musl target via
         # `zig cc`, so Nim + Zig from nixpkgs replace the GitHub-hosted
         # setup-nim-action + apt-get musl-tools (neither works on the
-        # self-hosted NixOS eph-linux-x64 runner).
+        # self-hosted NixOS `[self-hosted, linux, x64]` runners).
         run: nix shell nixpkgs#nim nixpkgs#zig -c bash ./build.sh --target linux-musl-x86_64 --out launcher
 
       - name: Pre-install Hex + rebar locally

@@ -45,7 +45,7 @@ jobs:
 
       - name: Install Hex + rebar (nixpkgs toolchain)
         # Erlang/Elixir from nixpkgs replace erlef/setup-beam so the job
-        # runs on the self-hosted NixOS eph-linux-x64 runner. setup-beam
+        # runs on the self-hosted NixOS `[self-hosted, linux, x64]` runners. setup-beam
         # installed hex + rebar by default; do the same here.
         run: nix shell nixpkgs#erlang nixpkgs#elixir -c bash -c 'mix local.hex --force && mix local.rebar --force'
 
