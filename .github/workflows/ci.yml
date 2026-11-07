@@ -333,6 +333,12 @@ jobs:
         # on every runner. Without it `nixpkgs#` was each host's registry
         # entry: an unpinned nixpkgs, which on 2026-10-21 no longer had
         # `erlang_26` and stopped the OTP 26 leg at evaluation.
+        #
+        # The inner `bash -c` gets its own `set -euo pipefail`: the step
+        # shell's errexit does not reach into it, so without it the leg's
+        # status was `just test-integration`'s alone, and a failing `mix
+        # local.hex` or `just build` (the rebar3_codetracer compile under
+        # this leg's OTP, which `just test-integration` never repeats) passed.
         run: |
           nix shell --inputs-from . \
             "${{ matrix.erlang-attr }}" \
@@ -343,6 +349,7 @@ jobs:
             nixpkgs#nim nixpkgs#nimble \
             nixpkgs#jq nixpkgs#shellcheck \
             -c bash -c '
+              set -euo pipefail
               mix local.hex --force
               mix local.rebar --force
               just build

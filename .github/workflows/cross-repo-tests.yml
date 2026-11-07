@@ -86,6 +86,20 @@ jobs:
             codetracer-trace-format
             codetracer-trace-format-nim
 
+      - name: Fetch the flake inputs later steps evaluate, while the token is valid
+        # The GitHub App token minted above is what nix presents for every
+        # github.com fetch (NIX_CONFIG `access-tokens`), and installation
+        # tokens expire one hour after they are minted. `Build codetracer`
+        # can outlast that hour, and after it nix still presents the dead
+        # token and GitHub answers `401 Bad credentials` -- for public
+        # repositories too. The extension's dev shell and this recorder's
+        # dev shell are first evaluated after that build, so fetch every
+        # input of both flakes now; later evaluations find them in the store.
+        shell: bash
+        run: |
+          nix flake archive --accept-flake-config "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          nix flake archive --accept-flake-config "$GITHUB_WORKSPACE"
+
       - name: Provide codetracer-trace-format into codetracer/libs (CI override)
         # The codetracer Build step below uses
         # ``--override-input codetracer-trace-format
