@@ -5,7 +5,7 @@
   {applications, [kernel, stdlib]},
   {env, []},
   {modules, []},
-  {licenses, ["MIT"]},
+  {licenses, ["Apache-2.0"]},
   {links, [{"GitHub", "https://github.com/metacraft-labs/codetracer-beam-recorder"},
            {"CHANGELOG", "https://github.com/metacraft-labs/codetracer-beam-recorder/blob/main/CHANGELOG.md"}]},
   {maintainers, ["Metacraft Labs"]}]}.
