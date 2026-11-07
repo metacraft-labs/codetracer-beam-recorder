@@ -83,10 +83,12 @@
 ## runs ~11s unmonitored but ~60s under the shim), so even an edge running
 ## essentially alone can exceed the default 60000ms per-test budget. So
 ## (2) the thirteen MONITORED integration edges are additionally given a
-## generous 300000ms (5 min) per-test ExUnit timeout, set purely on the
+## generous 600000ms (10 min) per-test ExUnit timeout, set purely on the
 ## edge command via ``elixir -e`` (see the loop below) — the ``.exs`` test
-## files stay BYTE-IDENTICAL and the unmonitored ``just test`` path keeps
-## ExUnit's 60000ms default (it does not use this recipe). No test is
+## files stay BYTE-IDENTICAL, and ``just test-integration`` gives the same
+## suites the same budget the same way (``exunit_timeout_prelude`` in the
+## ``Justfile``), because CPU contention alone, with no shim, takes single
+## tests past 60000ms on a loaded runner. No test is
 ## skipped, relaxed, or removed; a broken assertion still fails FAST. The
 ## cheap edges — the fifteen
 ## ``verify-*-no-silent-skip.sh`` gates, the CLI smoke edge, and the cargo
@@ -347,7 +349,7 @@ package codetracer_beam_recorder:
     # This removes cross-edge CPU contention but is necessary-not-sufficient
     # on its own (the dominant tip-over is monitor-shim overhead — see the
     # ExUnit-timeout note by the integration loop below, which raises the
-    # MONITORED edges' per-test budget to 5 min). NOTHING is skipped,
+    # MONITORED edges' per-test budget to 10 min). NOTHING is skipped,
     # relaxed, or removed. Mirrors FUP-E1
     # (``isonim.design-review-serial``) and ``nim_pty.pty-serial``. The
     # cheap gates (the fifteen ``verify-*-no-silent-skip.sh`` structural
@@ -445,19 +447,21 @@ package codetracer_beam_recorder:
     # they are just killed prematurely by a too-tight timeout under the
     # EXPECTED monitor overhead, so the serial pool above (which removes
     # cross-edge CPU contention) is necessary but not sufficient. We give
-    # the monitored edges a generous 5-minute budget so the shim's
+    # the monitored edges a generous 10-minute budget so the shim's
     # overhead cannot prematurely kill a correct, slow-under-monitor test.
     # This is NOT a weakening: a broken assertion still fails FAST (a
-    # failed assert never runs the clock out), and only the reprobuild
-    # edge is affected — the unmonitored ``just test`` path runs the same
-    # ``.exs`` files with ExUnit's built-in 60000ms default UNCHANGED (it
-    # does not go through this recipe). It is set purely on the EDGE
+    # failed assert never runs the clock out): only the budget changes,
+    # not what is asserted. ``just test-integration`` runs
+    # the same ``.exs`` files with the same budget, set the same way
+    # (``exunit_timeout_prelude`` in the ``Justfile``): unmonitored, CPU
+    # contention alone takes single tests past 60000ms on a loaded runner
+    # (measured on two contended cores: up to 268 s). It is set purely on the EDGE
     # COMMAND via ``elixir -e`` (the ``.exs`` files stay byte-identical):
     # the ``:ex_unit`` app is loaded first so its later ``ExUnit.start()``
     # app-load cannot clobber the value, then ``:timeout`` is put into the
     # app env BEFORE the required test file's ``ExUnit.start()`` reads it.
     # The underlying shim slowness is tracked as a separate follow-up.
-    const monitoredExUnitTimeoutMs = 300_000
+    const monitoredExUnitTimeoutMs = 600_000
     const exUnitTimeoutPrelude =
       "elixir -e 'Application.load(:ex_unit); " &
       "Application.put_env(:ex_unit, :timeout, " &
@@ -466,7 +470,7 @@ package codetracer_beam_recorder:
     for t in beamIntegrationTests:
       # Heavy live-BEAM edges → routed through the capacity-1 serial pool so
       # they do not race ExUnit's timeout under contention, AND given a
-      # raised (5 min) per-test ExUnit timeout so the ~5x monitor-shim
+      # raised (10 min) per-test ExUnit timeout so the ~5x monitor-shim
       # overhead cannot prematurely kill a correct, slow-under-monitor test.
       # RS-M8: the three web-span suites are recorded against real Hex
       # packages, so their edge fetches them first. Every other suite runs

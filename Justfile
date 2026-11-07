@@ -24,31 +24,45 @@ test-erlang:
 test-goldens:
   bash tests/verify-golden-contract.sh
 
+# Per-test ExUnit budget for the live-BEAM integration suites, the same
+# 600000 ms the repro.nim integration edges and the web-request suites'
+# `@moduletag timeout:` use. Each test drives real recorder runs (the
+# recorder compiles its Erlang runtime and the fixture, then records it),
+# so its wall-clock scales with the CPU it gets: pinned to two cores
+# shared with two busy-loop workers, single tests took up to 268 s
+# (e2e_tail_recursion_semantics_preserved; 154 s for
+# e2e_native_tracer_event_parity), and ExUnit's 60000 ms default killed
+# correct tests as `ExUnit.TimeoutError`. The budget bounds a hung test; it is not an
+# assertion, and a failed assertion still fails at once. `:ex_unit` is
+# loaded first so the suite's own `ExUnit.start()` keeps the value, and a
+# suite's `@moduletag timeout:` still overrides it.
+exunit_timeout_prelude := "elixir -e 'Application.load(:ex_unit); Application.put_env(:ex_unit, :timeout, 600_000)' -r"
+
 test-integration:
   cargo run --locked -- --help >/dev/null
   cargo run --locked -- --version | grep -F "$(grep -E '^version = "' Cargo.toml | head -n1 | cut -d '"' -f2)"
   trace_dir="$(mktemp -d "${TMPDIR:-/tmp}/codetracer-beam-recorder-cli.XXXXXX")"; set +e; cargo run --locked -- record --out-dir "$trace_dir" -- sh -c 'exit 7'; status="$?"; set -e; rm -rf "$trace_dir"; test "$status" -eq 7
-  elixir tests/integration/ctfs_writer_bridge_test.exs
-  elixir tests/integration/json_fallback_test.exs
+  {{exunit_timeout_prelude}} tests/integration/ctfs_writer_bridge_test.exs
+  {{exunit_timeout_prelude}} tests/integration/json_fallback_test.exs
   cargo build --locked
-  elixir tests/integration/runtime_session_test.exs
-  elixir tests/integration/launch_targets_test.exs
-  elixir tests/integration/function_trace_test.exs
-  elixir tests/integration/message_trace_test.exs
-  elixir tests/integration/manifest_source_location_test.exs
-  elixir tests/integration/step_instrumentation_test.exs
-  elixir tests/integration/native_tracer_parity_test.exs
-  elixir tests/integration/native_tracer_ordering_test.exs
-  elixir tests/integration/native_tracer_overflow_test.exs
-  elixir tests/integration/native_tracer_bench_test.exs
-  elixir tests/integration/otp_fixture_matrix_test.exs
-  elixir tests/integration/plug_smoke_test.exs
+  {{exunit_timeout_prelude}} tests/integration/runtime_session_test.exs
+  {{exunit_timeout_prelude}} tests/integration/launch_targets_test.exs
+  {{exunit_timeout_prelude}} tests/integration/function_trace_test.exs
+  {{exunit_timeout_prelude}} tests/integration/message_trace_test.exs
+  {{exunit_timeout_prelude}} tests/integration/manifest_source_location_test.exs
+  {{exunit_timeout_prelude}} tests/integration/step_instrumentation_test.exs
+  {{exunit_timeout_prelude}} tests/integration/native_tracer_parity_test.exs
+  {{exunit_timeout_prelude}} tests/integration/native_tracer_ordering_test.exs
+  {{exunit_timeout_prelude}} tests/integration/native_tracer_overflow_test.exs
+  {{exunit_timeout_prelude}} tests/integration/native_tracer_bench_test.exs
+  {{exunit_timeout_prelude}} tests/integration/otp_fixture_matrix_test.exs
+  {{exunit_timeout_prelude}} tests/integration/plug_smoke_test.exs
   just prepare-web-fixtures
-  elixir tests/integration/plug_requests_test.exs
-  elixir tests/integration/phoenix_requests_test.exs
-  elixir tests/integration/nested_requests_test.exs
-  elixir tests/integration/stress_event_volume_test.exs
-  elixir tests/integration/deep_call_nesting_test.exs
+  {{exunit_timeout_prelude}} tests/integration/plug_requests_test.exs
+  {{exunit_timeout_prelude}} tests/integration/phoenix_requests_test.exs
+  {{exunit_timeout_prelude}} tests/integration/nested_requests_test.exs
+  {{exunit_timeout_prelude}} tests/integration/stress_event_volume_test.exs
+  {{exunit_timeout_prelude}} tests/integration/deep_call_nesting_test.exs
 
 verify-trace-format-dependency:
   bash tests/verify-trace-format-dependency.sh
