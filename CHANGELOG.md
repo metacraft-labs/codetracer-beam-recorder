@@ -43,6 +43,17 @@ Versions are SemVer; the canonical version lives in `Cargo.toml`.
 
 ### Fixed
 
+- The OTP 26 + Elixir 1.16 CI leg can start. Its toolchain came from
+  each runner's unpinned `nixpkgs` registry entry, and once nixpkgs
+  dropped the end-of-life `erlang_26` the leg failed before it started.
+  Every matrix leg now takes its toolchain from a `flake.lock`-pinned
+  nixpkgs, OTP 26 from nixos-25.11, and
+  `tests/verify-ecosystem-matrix-toolchains.sh` (CI's lint job) checks
+  that each leg evaluates to the OTP and Elixir it names.
+- The Mix instrumentation works on OTP 26. With neither `Jason`
+  nor OTP 27's `:json` in the target project it died on the first
+  compiler-trace event (`module :json is not available`); it now falls
+  back to a built-in JSON codec.
 - Recorded `.ct` files are decodable by `ct print` again. The low-level
   supplement (`DropVariables` and the raw `Value` records, which the Nim
   multi-stream writer's C API cannot express) was appended into the

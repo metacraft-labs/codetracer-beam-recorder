@@ -23,8 +23,8 @@ name: launcher-integration
 
 # Single-edge cross-repo CI: when codetracer-beam-recorder changes,
 # verify the launcher's bundled-hex build still works against this
-# recorder's source. Mirrors the pattern in
-# codetracer-specs/Testing/Cross-Repo-CI-Integration.md.
+# recorder's source. Same single-edge pattern as the other recorders'
+# cross-repo workflows.
 #
 # Added as part of the M9 extension that brought BEAM / Hex.pm into
 # the campaign's package-manager matrix alongside the original
@@ -39,6 +39,7 @@ on:
     # not have, so no mainline push ever triggered this workflow.
     branches: [dev, stable]
   pull_request:
+    branches-ignore: [agents]
 
 # Cancel superseded PR runs only: a new push to a PR makes its previous run
 # moot, and stale runs otherwise hold scarce self-hosted runners. Every other
@@ -62,22 +63,32 @@ jobs:
           owner: metacraft-labs
 
       - uses: actions/checkout@v4
-        with:
-          path: codetracer-beam-recorder
 
-      - uses: metacraft-labs/metacraft-github-actions/clone-repo@dev
+      # The launcher is taken at the revision this commit's repro.lock pins.
+      # It used to be cloned at `main`, a branch codetracer-launcher does not
+      # have. clone-siblings clones it to ../codetracer-launcher, reading
+      # repro.lock from $GITHUB_WORKSPACE, which is why this repo is checked
+      # out there rather than into a subdirectory.
+      - name: Clone lock-pinned codetracer-launcher
+        uses: metacraft-labs/metacraft-github-actions/clone-siblings@dev
         with:
-          repo: metacraft-labs/codetracer-launcher
-          ref: main
-          path: codetracer-launcher
           gh-token: ${{ steps.app-token.outputs.token }}
+          siblings: codetracer-launcher
+
+      # Nix first: `[self-hosted, linux, x64]` can land on an ephemeral
+      # runner whose PATH does not carry `nix` until this action provisions
+      # it ("nix: command not found" on garm-* runners otherwise).
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
 
       - name: Build launcher
-        working-directory: codetracer-launcher
+        working-directory: ../codetracer-launcher
         # The launcher's build.sh cross-compiles the musl target via
         # `zig cc`, so Nim + Zig from nixpkgs replace the GitHub-hosted
         # setup-nim-action + apt-get musl-tools (neither works on the
-        # self-hosted NixOS eph-linux-x64 runner).
+        # self-hosted NixOS `[self-hosted, linux, x64]` runners).
         run: nix shell nixpkgs#nim nixpkgs#zig -c bash ./build.sh --target linux-musl-x86_64 --out launcher
 
       - name: Pre-install Hex + rebar locally
@@ -86,19 +97,19 @@ jobs:
         run: nix shell nixpkgs#erlang nixpkgs#elixir -c bash -c 'mix local.hex --force && mix local.rebar --force'
 
       - name: Build bundled hex package
-        working-directory: codetracer-launcher/packaging/hex
+        working-directory: ../codetracer-launcher/packaging/hex
         env:
           CT_LAUNCHER_VERSION: 0.1.0
-          CT_LAUNCHER_BIN: ${{ github.workspace }}/codetracer-launcher/out/launcher
+          CT_LAUNCHER_BIN: ${{ github.workspace }}/../codetracer-launcher/out/launcher
           CT_LAUNCHER_TARGET: linux-musl-x86_64
           # codetracer-beam-recorder's Elixir-side source lives at lib/.
           # The launcher's build_hex.exs vendors this tree under
           # priv/recorder/ inside the produced .tar.
-          CT_RECORDER_SRC: ${{ github.workspace }}/codetracer-beam-recorder/lib
+          CT_RECORDER_SRC: ${{ github.workspace }}/lib
         run: nix shell nixpkgs#erlang nixpkgs#elixir -c elixir build_hex.exs --out dist
 
       - name: Smoke-test the hex package
-        working-directory: codetracer-launcher/packaging/hex
+        working-directory: ../codetracer-launcher/packaging/hex
         run: |
           # The hex .tar contains a `contents.tar.gz` that holds the
           # package payload. We unpack into a sandbox and verify that
@@ -108,7 +119,7 @@ jobs:
           # smoke-test for the bundled artifact's contents.)
           sandbox="${RUNNER_TEMP}/hex-sandbox"
           mkdir -p "$sandbox" && cd "$sandbox"
-          tar -xf "${GITHUB_WORKSPACE}/codetracer-launcher/packaging/hex/dist/codetracer-0.1.0-linux-musl-x86_64.tar"
+          tar -xf "${GITHUB_WORKSPACE}/../codetracer-launcher/packaging/hex/dist/codetracer-0.1.0-linux-musl-x86_64.tar"
           tar -xzf contents.tar.gz
           out=$(./priv/ct --version)
           echo "$out"

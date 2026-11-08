@@ -194,6 +194,40 @@
         "type": "github"
       }
     },
+    "codetracer-trace-format": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793941317,
+        "narHash": "sha256-lCvqC3QQmBxG1hU/GRgENdGQw/XSGH3kH8Fv6a2wyME=",
+        "owner": "metacraft-labs",
+        "repo": "codetracer-trace-format",
+        "rev": "1f360faf4c8fbb60afc5b9af69af8a8273217000",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "ref": "agents",
+        "repo": "codetracer-trace-format",
+        "type": "github"
+      }
+    },
+    "codetracer-trace-format-nim": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793939734,
+        "narHash": "sha256-AEJ/52LVtoNcqJC4N3yD1bnTbhlfAHF3DqImTElH+EY=",
+        "owner": "metacraft-labs",
+        "repo": "codetracer-trace-format-nim",
+        "rev": "d282be4c45f3f31ce6b666f79a1bd8b6813010c7",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "ref": "agents",
+        "repo": "codetracer-trace-format-nim",
+        "type": "github"
+      }
+    },
     "crane": {
       "locked": {
         "lastModified": 1776635034,
@@ -1105,6 +1139,38 @@
         "type": "github"
       }
     },
+    "nim-results": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792307661,
+        "narHash": "sha256-gD+5DVe1C6L0gc1geVbXZKeI/Zo4HlwFO/l1DUY31OA=",
+        "owner": "arnetheduck",
+        "repo": "nim-results",
+        "rev": "6f4e4b08901645f41eae7730b29b8c1137365eb0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "arnetheduck",
+        "repo": "nim-results",
+        "type": "github"
+      }
+    },
+    "nim-stew": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792505758,
+        "narHash": "sha256-Xyrk54e2tEnPhLvwo0o+IxE4s2skynqTp/mhTdRJ6jM=",
+        "owner": "status-im",
+        "repo": "nim-stew",
+        "rev": "168d3a2c40cf483de969fad479d8305256100aee",
+        "type": "github"
+      },
+      "original": {
+        "owner": "status-im",
+        "repo": "nim-stew",
+        "type": "github"
+      }
+    },
     "nix": {
       "inputs": {
         "flake-compat": [
@@ -1729,6 +1795,22 @@
         "type": "github"
       }
     },
+    "nixpkgs-otp26": {
+      "locked": {
+        "lastModified": 1782847189,
+        "narHash": "sha256-twXPFqFsrrY5r28Zh7Homgcp2gUMBgQ6WDS98Q/3xFI=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "b6018f87da91d19d0ab4cf979885689b469cdd41",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-25.11",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "nixpkgs-unstable": {
       "locked": {
         "lastModified": 1776548001,
@@ -1924,6 +2006,8 @@
     },
     "root": {
       "inputs": {
+        "codetracer-trace-format": "codetracer-trace-format",
+        "codetracer-trace-format-nim": "codetracer-trace-format-nim",
         "flake-parts": [
           "nixos-modules",
           "flake-parts"
@@ -1932,11 +2016,14 @@
           "nixos-modules",
           "git-hooks-nix"
         ],
+        "nim-results": "nim-results",
+        "nim-stew": "nim-stew",
         "nixos-modules": "nixos-modules",
         "nixpkgs": [
           "nixos-modules",
           "nixpkgs-unstable"
-        ]
+        ],
+        "nixpkgs-otp26": "nixpkgs-otp26"
       }
     },
     "rust-analyzer-src": {

@@ -101,7 +101,9 @@ instrument_forms(Forms, Module, SourcePath) ->
     {Instrumented, State} =
         lists:mapfoldl(
             fun(Form, State0) -> instrument_form(Form, Module, SourcePath, State0) end,
-            #{locations => [], variable_slot_templates => []},
+            #{locations => [], variable_slot_templates => [],
+              used_variables => maps:from_list([{V, true} || V <- all_variables(Forms)]),
+              next_temp => 0},
             Forms
         ),
     {Instrumented, maps:get(locations, State), maps:get(variable_slot_templates, State)}.
@@ -162,7 +164,10 @@ instrument_body_expr({match, Anno, Pattern, Rhs}, Module, SourcePath, Name, Arit
             FunctionKey = function_key(Module, Name, Arity),
             {Bindings, Visible, State} =
                 bindings_for_variables(NewVariables, FunctionKey, "match_expression", Visible0, State1),
-            Temp = list_to_atom("CodetracerMatchRhs" ++ integer_to_list(fnv1a(lists:flatten(io_lib:format("~p", [Anno]))))),
+            % Compiler-generated matches can share an annotation (notably
+            % Plug's route macros). Every RHS needs its own temporary, and
+            % it must not capture a variable already in the original forms.
+            {Temp, StateWithTemp} = fresh_match_temp(State),
             GenAnno = erl_anno:set_generated(true, Anno),
             TempVar = {var, GenAnno, Temp},
             BindExprs = binding_exprs(Bindings, GenAnno),
@@ -170,11 +175,24 @@ instrument_body_expr({match, Anno, Pattern, Rhs}, Module, SourcePath, Name, Arit
                 {match, GenAnno, TempVar, NewRhs},
                 {match, Anno, Pattern, TempVar}
             ] ++ BindExprs ++ [TempVar]},
-            {Block, Visible, State}
+            {Block, Visible, StateWithTemp}
     end;
 instrument_body_expr(Expr, Module, SourcePath, Name, Arity, _NonTail, Visible, State0) ->
     {NewExpr, State} = instrument_expr(Expr, Module, SourcePath, Name, Arity, State0),
     {NewExpr, Visible, State}.
+
+all_variables({var, _Anno, Name}) -> [Name];
+all_variables(Term) when is_tuple(Term) -> all_variables(tuple_to_list(Term));
+all_variables(Term) when is_list(Term) -> lists:flatmap(fun all_variables/1, Term);
+all_variables(_Term) -> [].
+
+fresh_match_temp(#{next_temp := Index, used_variables := Used} = State) ->
+    Name = list_to_atom("CodetracerMatchRhs" ++ integer_to_list(Index)),
+    NextState = State#{next_temp := Index + 1},
+    case maps:is_key(Name, Used) of
+        true -> fresh_match_temp(NextState);
+        false -> {Name, NextState#{used_variables := Used#{Name => true}}}
+    end.
 
 instrument_expr({'case', Anno, Expr, Clauses}, Module, SourcePath, Name, Arity, State0) ->
     {NewExpr, State1} = instrument_expr(Expr, Module, SourcePath, Name, Arity, State0),

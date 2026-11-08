@@ -19,11 +19,11 @@ set -euo pipefail
 #
 # Sibling revisions for the downstream regression set
 # (codetracer-trace-format, codetracer, codetracer-vscode-extension) are
-# resolved by CI through the repo-workspaces workspace lock
-# (scripts/resolve-sibling-rev.sh); the legacy committed sibling-pin
-# files are forbidden by the canonical repo requirements
-# (runquota/scripts/check_repo_requirements.sh) and are no longer checked
-# here.
+# the ones this commit's repro.lock pins; CI clones them through
+# metacraft-github-actions setup-dev-env / clone-siblings. The legacy
+# committed sibling-pin files are forbidden by the canonical repo
+# requirements (runquota/scripts/check_repo_requirements.sh) and are no
+# longer checked here.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -70,9 +70,13 @@ grep -Fq 'name = "codetracer-beam-recorder"' Cargo.toml ||
   fail "Cargo.toml [package].name must be 'codetracer-beam-recorder'"
 ok "Cargo.toml package name is canonical"
 
-grep -Fq 'license = "MIT"' Cargo.toml ||
-  fail "Cargo.toml [package].license must be 'MIT'"
-ok "Cargo.toml declares MIT license"
+# The repository is licensed under Apache-2.0 (LICENSE). Every package
+# manifest that is published -- the crate, the Hex package and the rebar3
+# plugin -- must declare the same licence; sections 2, 3 and 5 check the
+# other three.
+grep -Fq 'license = "Apache-2.0"' Cargo.toml ||
+  fail "Cargo.toml [package].license must be 'Apache-2.0' (matches LICENSE)"
+ok "Cargo.toml declares Apache-2.0 license"
 
 grep -Fq 'repository = "' Cargo.toml ||
   fail "Cargo.toml [package].repository missing"
@@ -102,9 +106,9 @@ grep -Fq 'description: ' mix.exs ||
   fail "mix.exs must declare a Hex description"
 ok "mix.exs declares description"
 
-grep -Fq 'licenses' mix.exs ||
-  fail "mix.exs must declare licenses metadata"
-ok "mix.exs declares licenses"
+grep -Fq 'licenses: ["Apache-2.0"]' mix.exs ||
+  fail "mix.exs must declare licenses: [\"Apache-2.0\"] (matches Cargo.toml and LICENSE)"
+ok "mix.exs declares Apache-2.0 licenses"
 
 grep -Fq 'links' mix.exs ||
   fail "mix.exs must declare links metadata"
@@ -127,9 +131,9 @@ grep -Fq 'description' "$app_src" ||
   fail "$app_src must declare a description"
 ok "$app_src declares description"
 
-grep -Fq 'licenses' "$app_src" ||
-  fail "$app_src must declare licenses"
-ok "$app_src declares licenses"
+grep -Fq '{licenses, ["Apache-2.0"]}' "$app_src" ||
+  fail "$app_src must declare {licenses, [\"Apache-2.0\"]} (matches Cargo.toml and LICENSE)"
+ok "$app_src declares Apache-2.0 licenses"
 
 # ---------- 4. CHANGELOG ----------
 bold "CHANGELOG.md"
@@ -143,9 +147,10 @@ ok "CHANGELOG.md references current version $cargo_version"
 # ---------- 5. LICENSE ----------
 bold "LICENSE"
 [[ -f LICENSE ]] || fail "LICENSE file missing"
-grep -Fq 'MIT License' LICENSE ||
-  fail "LICENSE file must declare MIT License (matches Cargo.toml license = \"MIT\")"
-ok "LICENSE declares MIT"
+if ! grep -Fq 'Apache License' LICENSE || ! grep -Fq 'Version 2.0, January 2004' LICENSE; then
+  fail "LICENSE file must be the Apache License, Version 2.0 (matches Cargo.toml license = \"Apache-2.0\")"
+fi
+ok "LICENSE is the Apache License, Version 2.0"
 
 # ---------- 6. Build artifact ----------
 bold "Build artifact"
@@ -174,10 +179,9 @@ if ! echo "$cli_version_line" | grep -Fq "$cargo_version"; then
 fi
 ok "$cli_version_line"
 
-# Real downstream regression suites are run by CI through the
-# workspace-locked siblings, resolved via
-# scripts/resolve-sibling-rev.sh against the repo-workspaces workspace
-# lock. The legacy committed sibling-pin files are forbidden by the
+# Real downstream regression suites are run by CI against the siblings
+# this commit's repro.lock pins, cloned by setup-dev-env /
+# clone-siblings. The legacy committed sibling-pin files are forbidden by the
 # canonical repo requirements (runquota/scripts/check_repo_requirements.sh),
 # so release-check no longer asserts their presence.
 

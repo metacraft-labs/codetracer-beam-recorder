@@ -8,7 +8,7 @@ build-native:
   cd rebar3_codetracer && rebar3 compile
 
 test:
-  if ! command -v cargo >/dev/null 2>&1 || ! command -v nimble >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v elixir >/dev/null 2>&1 || ! command -v mix >/dev/null 2>&1 || ! command -v erl >/dev/null 2>&1 || ! command -v erlc >/dev/null 2>&1 || ! command -v rebar3 >/dev/null 2>&1; then nix develop --command just test; else just test-rust && just test-goldens && just test-elixir && just test-erlang && just verify-trace-format-dependency && just test-integration && just verify-elixir-fixture-generation-no-silent-skip && just verify-beam-fixture-generation-no-silent-skip && just verify-runtime-session-test-no-silent-skip && just verify-launch-targets-test-no-silent-skip && just verify-function-trace-test-no-silent-skip && just verify-message-trace-test-no-silent-skip && just verify-manifest-source-location-test-no-silent-skip && just verify-step-instrumentation-test-no-silent-skip && just verify-native-tracer-parity-test-no-silent-skip && just verify-native-tracer-ordering-test-no-silent-skip && just verify-native-tracer-overflow-test-no-silent-skip && just verify-native-tracer-bench-test-no-silent-skip && just verify-otp-fixture-matrix-test-no-silent-skip && just verify-plug-smoke-test-no-silent-skip && just verify-plug-requests-test-no-silent-skip && just verify-phoenix-requests-test-no-silent-skip && just verify-nested-requests-test-no-silent-skip && just verify-stress-event-volume-test-no-silent-skip && just verify-release-check-no-silent-skip; fi
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v nimble >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v elixir >/dev/null 2>&1 || ! command -v mix >/dev/null 2>&1 || ! command -v erl >/dev/null 2>&1 || ! command -v erlc >/dev/null 2>&1 || ! command -v rebar3 >/dev/null 2>&1 || ! command -v yq >/dev/null 2>&1; then nix develop --command just test; else just test-rust && just test-goldens && just test-elixir && just test-erlang && just verify-trace-format-dependency && just verify-ci-sibling-provisioning && just test-integration && just verify-elixir-fixture-generation-no-silent-skip && just verify-beam-fixture-generation-no-silent-skip && just verify-runtime-session-test-no-silent-skip && just verify-launch-targets-test-no-silent-skip && just verify-function-trace-test-no-silent-skip && just verify-message-trace-test-no-silent-skip && just verify-manifest-source-location-test-no-silent-skip && just verify-step-instrumentation-test-no-silent-skip && just verify-native-tracer-parity-test-no-silent-skip && just verify-native-tracer-ordering-test-no-silent-skip && just verify-native-tracer-overflow-test-no-silent-skip && just verify-native-tracer-bench-test-no-silent-skip && just verify-otp-fixture-matrix-test-no-silent-skip && just verify-plug-smoke-test-no-silent-skip && just verify-plug-requests-test-no-silent-skip && just verify-phoenix-requests-test-no-silent-skip && just verify-nested-requests-test-no-silent-skip && just verify-stress-event-volume-test-no-silent-skip && just verify-release-check-no-silent-skip; fi
 
 t: test
 
@@ -24,32 +24,60 @@ test-erlang:
 test-goldens:
   bash tests/verify-golden-contract.sh
 
+# Per-test ExUnit budget for the live-BEAM integration suites, the same
+# 600000 ms the repro.nim integration edges and the web-request suites'
+# `@moduletag timeout:` use. Each test drives real recorder runs (the
+# recorder compiles its Erlang runtime and the fixture, then records it),
+# so its wall-clock scales with the CPU it gets: pinned to two cores
+# shared with two busy-loop workers, single tests took up to 268 s
+# (e2e_tail_recursion_semantics_preserved; 154 s for
+# e2e_native_tracer_event_parity), and ExUnit's 60000 ms default killed
+# correct tests as `ExUnit.TimeoutError`. The budget bounds a hung test; it is not an
+# assertion, and a failed assertion still fails at once. `:ex_unit` is
+# loaded first so the suite's own `ExUnit.start()` keeps the value, and a
+# suite's `@moduletag timeout:` still overrides it.
+exunit_timeout_prelude := "elixir -e 'Application.load(:ex_unit); Application.put_env(:ex_unit, :timeout, 600_000)' -r"
+
 test-integration:
   cargo run --locked -- --help >/dev/null
   cargo run --locked -- --version | grep -F "$(grep -E '^version = "' Cargo.toml | head -n1 | cut -d '"' -f2)"
   trace_dir="$(mktemp -d "${TMPDIR:-/tmp}/codetracer-beam-recorder-cli.XXXXXX")"; set +e; cargo run --locked -- record --out-dir "$trace_dir" -- sh -c 'exit 7'; status="$?"; set -e; rm -rf "$trace_dir"; test "$status" -eq 7
-  elixir tests/integration/ctfs_writer_bridge_test.exs
+  {{exunit_timeout_prelude}} tests/integration/ctfs_writer_bridge_test.exs
+  {{exunit_timeout_prelude}} tests/integration/json_fallback_test.exs
   cargo build --locked
-  elixir tests/integration/runtime_session_test.exs
-  elixir tests/integration/launch_targets_test.exs
-  elixir tests/integration/function_trace_test.exs
-  elixir tests/integration/message_trace_test.exs
-  elixir tests/integration/manifest_source_location_test.exs
-  elixir tests/integration/step_instrumentation_test.exs
-  elixir tests/integration/native_tracer_parity_test.exs
-  elixir tests/integration/native_tracer_ordering_test.exs
-  elixir tests/integration/native_tracer_overflow_test.exs
-  elixir tests/integration/native_tracer_bench_test.exs
-  elixir tests/integration/otp_fixture_matrix_test.exs
-  elixir tests/integration/plug_smoke_test.exs
+  {{exunit_timeout_prelude}} tests/integration/runtime_session_test.exs
+  {{exunit_timeout_prelude}} tests/integration/launch_targets_test.exs
+  {{exunit_timeout_prelude}} tests/integration/function_trace_test.exs
+  {{exunit_timeout_prelude}} tests/integration/message_trace_test.exs
+  {{exunit_timeout_prelude}} tests/integration/manifest_source_location_test.exs
+  {{exunit_timeout_prelude}} tests/integration/step_instrumentation_test.exs
+  {{exunit_timeout_prelude}} tests/integration/native_tracer_parity_test.exs
+  {{exunit_timeout_prelude}} tests/integration/native_tracer_ordering_test.exs
+  {{exunit_timeout_prelude}} tests/integration/native_tracer_overflow_test.exs
+  {{exunit_timeout_prelude}} tests/integration/native_tracer_bench_test.exs
+  {{exunit_timeout_prelude}} tests/integration/otp_fixture_matrix_test.exs
+  {{exunit_timeout_prelude}} tests/integration/plug_smoke_test.exs
   just prepare-web-fixtures
-  elixir tests/integration/plug_requests_test.exs
-  elixir tests/integration/phoenix_requests_test.exs
-  elixir tests/integration/nested_requests_test.exs
-  elixir tests/integration/stress_event_volume_test.exs
+  {{exunit_timeout_prelude}} tests/integration/plug_requests_test.exs
+  {{exunit_timeout_prelude}} tests/integration/phoenix_requests_test.exs
+  {{exunit_timeout_prelude}} tests/integration/nested_requests_test.exs
+  {{exunit_timeout_prelude}} tests/integration/stress_event_volume_test.exs
+  {{exunit_timeout_prelude}} tests/integration/deep_call_nesting_test.exs
 
 verify-trace-format-dependency:
   bash tests/verify-trace-format-dependency.sh
+
+# Every CI job that builds the crate takes the trace-format siblings at the
+# revision repro.lock pins, through setup-dev-env / clone-siblings only.
+verify-ci-sibling-provisioning:
+  bash tests/verify-ci-sibling-provisioning.sh
+
+# Every ecosystem-matrix leg in ci.yml evaluates, from flake.lock, to the
+# OTP/Elixir pair it names. It needs nix and the network (it evaluates the
+# locked nixpkgs), so it is neither in `just test`, whose repro.nim twin runs
+# no nix, nor in `just lint`, the pre-commit hook: CI runs it in the lint job.
+verify-ecosystem-matrix-toolchains:
+  bash tests/verify-ecosystem-matrix-toolchains.sh
 
 verify-elixir-fixture-generation-no-silent-skip:
   bash tests/verify-elixir-fixture-generation-no-silent-skip.sh
@@ -177,7 +205,7 @@ record-request-panel-fixture OUT FRAMEWORK="plug":
   echo "[fixture] wrote {{OUT}}/app.ct"
 
 lint:
-  if ! command -v cargo >/dev/null 2>&1 || ! command -v nimble >/dev/null 2>&1 || ! command -v nixfmt >/dev/null 2>&1 || ! command -v shellcheck >/dev/null 2>&1; then nix develop --command just lint; else just lint-nix && just lint-rust && just lint-shell && just verify-repo-requirements && just verify-trace-format-dependency; fi
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v nimble >/dev/null 2>&1 || ! command -v nixfmt >/dev/null 2>&1 || ! command -v shellcheck >/dev/null 2>&1 || ! command -v yq >/dev/null 2>&1; then nix develop --command just lint; else just lint-nix && just lint-rust && just lint-shell && just verify-repo-requirements && just verify-trace-format-dependency && just verify-ci-sibling-provisioning; fi
 
 lint-nix:
   nixfmt --check flake.nix
@@ -187,7 +215,7 @@ lint-rust:
   cargo clippy --locked --all-targets -- -D warnings
 
 lint-shell:
-  shellcheck tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/verify-beam-fixture-generation-no-silent-skip.sh tests/verify-runtime-session-test-no-silent-skip.sh tests/verify-launch-targets-test-no-silent-skip.sh tests/verify-function-trace-test-no-silent-skip.sh tests/verify-message-trace-test-no-silent-skip.sh tests/verify-manifest-source-location-test-no-silent-skip.sh tests/verify-step-instrumentation-test-no-silent-skip.sh tests/verify-native-tracer-parity-test-no-silent-skip.sh tests/verify-native-tracer-ordering-test-no-silent-skip.sh tests/verify-native-tracer-overflow-test-no-silent-skip.sh tests/verify-native-tracer-bench-test-no-silent-skip.sh tests/verify-otp-fixture-matrix-test-no-silent-skip.sh tests/verify-plug-smoke-test-no-silent-skip.sh tests/verify-plug-requests-test-no-silent-skip.sh tests/verify-phoenix-requests-test-no-silent-skip.sh tests/verify-nested-requests-test-no-silent-skip.sh tests/verify-stress-event-volume-test-no-silent-skip.sh tests/verify-release-check-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
+  shellcheck tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-ci-sibling-provisioning.sh tests/verify-ecosystem-matrix-toolchains.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/verify-beam-fixture-generation-no-silent-skip.sh tests/verify-runtime-session-test-no-silent-skip.sh tests/verify-launch-targets-test-no-silent-skip.sh tests/verify-function-trace-test-no-silent-skip.sh tests/verify-message-trace-test-no-silent-skip.sh tests/verify-manifest-source-location-test-no-silent-skip.sh tests/verify-step-instrumentation-test-no-silent-skip.sh tests/verify-native-tracer-parity-test-no-silent-skip.sh tests/verify-native-tracer-ordering-test-no-silent-skip.sh tests/verify-native-tracer-overflow-test-no-silent-skip.sh tests/verify-native-tracer-bench-test-no-silent-skip.sh tests/verify-otp-fixture-matrix-test-no-silent-skip.sh tests/verify-plug-smoke-test-no-silent-skip.sh tests/verify-plug-requests-test-no-silent-skip.sh tests/verify-phoenix-requests-test-no-silent-skip.sh tests/verify-nested-requests-test-no-silent-skip.sh tests/verify-stress-event-volume-test-no-silent-skip.sh tests/verify-release-check-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
 
 verify-repo-requirements:
   bash tests/verify-repo-requirements.sh
@@ -204,7 +232,7 @@ format-rust:
   cargo fmt
 
 format-shell:
-  shfmt -w tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/verify-beam-fixture-generation-no-silent-skip.sh tests/verify-runtime-session-test-no-silent-skip.sh tests/verify-launch-targets-test-no-silent-skip.sh tests/verify-function-trace-test-no-silent-skip.sh tests/verify-message-trace-test-no-silent-skip.sh tests/verify-manifest-source-location-test-no-silent-skip.sh tests/verify-step-instrumentation-test-no-silent-skip.sh tests/verify-native-tracer-parity-test-no-silent-skip.sh tests/verify-native-tracer-ordering-test-no-silent-skip.sh tests/verify-native-tracer-overflow-test-no-silent-skip.sh tests/verify-native-tracer-bench-test-no-silent-skip.sh tests/verify-otp-fixture-matrix-test-no-silent-skip.sh tests/verify-plug-smoke-test-no-silent-skip.sh tests/verify-plug-requests-test-no-silent-skip.sh tests/verify-phoenix-requests-test-no-silent-skip.sh tests/verify-nested-requests-test-no-silent-skip.sh tests/verify-stress-event-volume-test-no-silent-skip.sh tests/verify-release-check-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
+  shfmt -w tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-ci-sibling-provisioning.sh tests/verify-ecosystem-matrix-toolchains.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/verify-beam-fixture-generation-no-silent-skip.sh tests/verify-runtime-session-test-no-silent-skip.sh tests/verify-launch-targets-test-no-silent-skip.sh tests/verify-function-trace-test-no-silent-skip.sh tests/verify-message-trace-test-no-silent-skip.sh tests/verify-manifest-source-location-test-no-silent-skip.sh tests/verify-step-instrumentation-test-no-silent-skip.sh tests/verify-native-tracer-parity-test-no-silent-skip.sh tests/verify-native-tracer-ordering-test-no-silent-skip.sh tests/verify-native-tracer-overflow-test-no-silent-skip.sh tests/verify-native-tracer-bench-test-no-silent-skip.sh tests/verify-otp-fixture-matrix-test-no-silent-skip.sh tests/verify-plug-smoke-test-no-silent-skip.sh tests/verify-plug-requests-test-no-silent-skip.sh tests/verify-phoenix-requests-test-no-silent-skip.sh tests/verify-nested-requests-test-no-silent-skip.sh tests/verify-stress-event-volume-test-no-silent-skip.sh tests/verify-release-check-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
 
 test-integration-fixture:
   just test-integration
@@ -239,7 +267,7 @@ bump-version new_version:
       print("(cargo not on PATH; skipping cargo update)")
 
 # --- M13: Packaging UX Standardization ---
-# Implements Repo-Requirements.md §2.8 packaging UX for the BEAM
+# Implements Repo-Requirements.md §2.5 packaging UX for the BEAM
 # language-ecosystem recorder. Single channel: hex.
 
 # Build a release artifact for the given channel.
@@ -290,3 +318,8 @@ build-hex:
 
 verify-hex:
   just verify-package hex
+
+# Entering the dev shell from another git repository must write nothing there.
+# Runs `nix develop`, so it is not part of the in-shell test recipes.
+test-dev-shell:
+    bash tests/test_dev_shell_writes_nothing_elsewhere.sh

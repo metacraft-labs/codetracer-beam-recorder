@@ -9,9 +9,8 @@
 #
 #   metacraft-labs/codetracer/.github/workflows/launcher-recorder-e2e.yml
 #
-# Design: codetracer-specs/Testing/Launcher-Recorder-Compatibility-Tests.md
-#         section 6 "CI wiring: three trigger edges, one reusable workflow".
-# Milestone: LRC-4 (the beam edge of the fan-out; the workflow itself is LRC-3).
+# Design: three trigger edges (desktop core, launcher, each recorder) share
+# one reusable workflow, so every edge runs the same assertions.
 #
 # WHY THIS EDGE IN PARTICULAR.  The beam edge is the standing proof of a bug
 # this initiative caught and fixed: `ct record foo.ex` reaches this recorder as
@@ -28,22 +27,16 @@
 # workflow makes the TRIGGERING repo its primary `actions/checkout` at
 # `${{ github.sha }}`; inside a reusable workflow that context is the caller's.
 # The launcher, the desktop core, its agent-surface build-deps and
-# codetracer-trace-format-nim are cloned beside it at the revisions the
-# per-commit WORKSPACE LOCK pins for this commit, per
-# metacraft-dev-guidelines/policies/ci-shared-dev-env.md section 3.2.
+# codetracer-trace-format-nim are cloned beside it at the revisions this
+# commit's own committed `repro.lock` pins.
 #
-# LOCK STATUS.  A lock-resolved sibling needs a workspace lock keyed by THIS
-# repo's commit.  A push to this repo without a lock published for the new tip
-# leaves this edge failing in `Setup dev env` with "No workspace lock for
-# codetracer-beam-recorder" (one push of grace on `push` via
-# `github.event.before`, none on a `pull_request` once the base moves).  The
-# remedy is NOT in this repository: `repro workspace lock
-# --trigger-repo=codetracer-beam-recorder` + a push to
-# metacraft-labs/metacraft-manifests, from a workspace whose `.repro/manifests`
-# is a real git checkout AND whose nim-agents / nim-acp are current (a lock
-# generated from stale agent-surface checkouts pins a nim-agents that predates
-# `loadSession`, and codetracer's sibling-override build then fails).  Do NOT
-# paper over a missing lock with a `<name>=<ref>` sibling override.
+# LOCK STATUS.  A sibling this commit's `repro.lock` does not pin leaves this
+# edge failing in `Setup dev env`.  The remedy is to refresh the lock from a
+# workspace whose sibling checkouts are current (`repro ws lock`, which the
+# pre-push hook also runs) and commit it; a lock refreshed from stale
+# agent-surface checkouts pins a nim-agents that predates `loadSession`, and
+# codetracer's sibling-override build then fails.  Do NOT paper over a missing
+# pin with a `<name>=<ref>` sibling override.
 #
 # WHAT IT ASSERTS ABOUT THIS REPO.  Everything comes from this repo's own
 # checked-in contract fixture, `cross-repo/launcher-compat.yml`: the sample
@@ -69,6 +62,7 @@ on:
   push:
     branches: [main, dev, stable]
   pull_request:
+    branches-ignore: [agents]
   workflow_dispatch:
 
 permissions:

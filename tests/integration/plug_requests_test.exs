@@ -69,12 +69,50 @@ defmodule CodetracerBeamRecorder.PlugRequestsTest do
     out_dir = H.tmp_dir!("rs-m8-plug")
     output = H.record!(@fixture_dir, out_dir, "PlugWeb.main()", build_root: build_root)
 
+    # Plug's generated route matcher contains multiple non-tail matches
+    # sharing a source annotation. The full status/route assertions below
+    # are also a semantic regression for fresh transform temporaries: reusing
+    # one temporary for a map and then a fun turns every route into a badmatch.
     expected_count = @cohort_size + length(@sequential_requests)
 
-    assert String.contains?(output, "plug-web-ok requests=#{expected_count} cohort=#{@cohort_size}"),
+    assert String.contains?(
+             output,
+             "plug-web-ok requests=#{expected_count} cohort=#{@cohort_size}"
+           ),
            "the demo must report its own schedule on stdout, got:\n#{output}"
 
     spans = H.read_spans!(out_dir)
+
+    {summary_json, summary_status} =
+      System.cmd(
+        H.recorder_binary!(),
+        ["read-bundle-summary", "--bundle", out_dir],
+        stderr_to_stdout: true
+      )
+
+    assert summary_status == 0, summary_json
+    summary = H.decode_json!(summary_json |> String.split("\n", trim: true) |> List.last())
+    assert length(summary["span_entry_steps"]) == expected_count
+
+    assert Enum.sort(Enum.map(summary["span_entry_steps"], & &1["span_id"])) ==
+             Enum.sort(Enum.map(spans, & &1["span_id"]))
+
+    for entry <- summary["span_entry_steps"] do
+      span = Enum.find(spans, &(&1["span_id"] == entry["span_id"]))
+      assert entry["step_index"] == span["start_step"]
+      assert entry["thread_id"] == span["thread_id"]
+
+      assert entry["step"]["kind"] in ["absolute_step", "delta_step"],
+             "request entry must be a handler source step, got #{inspect(entry)}"
+
+      assert String.ends_with?(entry["location"]["path"], "/lib/plug_web/router.ex"),
+             "request entry must seek to router.ex, got #{inspect(entry)}"
+
+      # `use Plug.Router` defines Router.call/2 at line 11; this is the
+      # router's actual entry point, before match/dispatch chooses a route.
+      assert entry["location"]["line"] == 11
+      assert H.meta(span)["beam.handler_step_available"] == "true"
+    end
 
     assert length(spans) == expected_count,
            "expected one settled span per request, got #{length(spans)}"
@@ -145,6 +183,7 @@ defmodule CodetracerBeamRecorder.PlugRequestsTest do
     # --- the sequential tail --------------------------------------------
     assert Enum.map(sequential, fn span ->
              m = H.meta(span)
+
              {m["http.method"], m["http.url"], String.to_integer(m["http.status_code"]),
               m["http.route"]}
            end) == @sequential_requests
@@ -170,7 +209,10 @@ defmodule CodetracerBeamRecorder.PlugRequestsTest do
     # so a url-only key would silently drop one of them.
     by_url = Map.new(spans, &{{H.meta(&1)["http.method"], H.meta(&1)["http.url"]}, &1})
     assert by_url[{"GET", "/api/users/999"}]["status"] == 2, "a 404 is an error status"
-    assert by_url[{"GET", "/boom"}]["status"] == 2, "a raising handler answered 500 is an error status"
+
+    assert by_url[{"GET", "/boom"}]["status"] == 2,
+           "a raising handler answered 500 is an error status"
+
     assert by_url[{"GET", "/healthz"}]["status"] == 1
     assert by_url[{"GET", "/static/app.css"}]["status"] == 1, "a 304 is not an error"
 
@@ -253,5 +295,42 @@ defmodule CodetracerBeamRecorder.PlugRequestsTest do
 
            #{inspect(Enum.map(sequential_spans, &{H.meta(&1)["http.url"], &1["contiguous_on_one_thread"]}))}
            """
+  end
+
+  test "filtered request handlers explicitly have no seek target" do
+    build_root = H.tmp_dir!("rs-m8-filtered-build")
+    H.compile_demo!(@fixture_dir, build_root)
+    out_dir = H.tmp_dir!("rs-m8-filtered")
+    # Only the driver is traced; no handler, endpoint or barrier source steps
+    # can become a request's seek coordinate.
+    {output, status} =
+      System.cmd(
+        H.recorder_binary!(),
+        [
+          "record",
+          "--out-dir",
+          out_dir,
+          "--include-module",
+          "Elixir.PlugWeb",
+          "--",
+          "mix",
+          "run",
+          "--no-compile",
+          "-e",
+          "PlugWeb.main()"
+        ],
+        cd: @fixture_dir,
+        env: [{"MIX_ENV", "test"}, {"MIX_BUILD_ROOT", build_root}],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, output
+    spans = H.read_spans!(out_dir)
+    assert length(spans) == @cohort_size + length(@sequential_requests)
+
+    for span <- spans do
+      assert span["is_open"] == false
+      assert H.meta(span)["beam.handler_step_available"] == "false"
+    end
   end
 end

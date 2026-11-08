@@ -6,6 +6,7 @@
 -export([start/2, stop/1]).
 -export([start_session/1, step/1, bind_many/1, stop_session/1]).
 -export([web_request_start/1, web_request_stop/2]).
+-export([recorder_traffic/1, message_repr/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -record(state, {
@@ -680,7 +681,39 @@ drain_trace_messages(File, State) ->
         State
     end.
 
-write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) ->
+%% A message between the program and the recorder's own runtime processes is
+%% the recorder at work, not the program: the instrumented code reaches the
+%% session with `gen_server:call/3' on every step and binding. Such messages
+%% are dropped before they reach the sidecar, and the session never becomes
+%% one of the recording's threads.
+write_trace_message(File, Message, State) ->
+    case recorder_traffic(Message) of
+        true -> {ok, State};
+        false -> write_program_trace_message(File, Message, State)
+    end.
+
+%% True for a send to, or a receive from, a recorder runtime process (this
+%% session or the native tracer), whether it is named by pid or by its
+%% registered name.
+recorder_traffic({trace, _Pid, send, _Message, Recipient}) ->
+    recorder_process(Recipient);
+recorder_traffic({trace, _Pid, send_to_non_existing_process, _Message, Recipient}) ->
+    recorder_process(Recipient);
+recorder_traffic({trace, _Pid, 'receive', _Message, Sender}) ->
+    recorder_process(Sender);
+recorder_traffic(_Message) ->
+    false.
+
+recorder_process(Name) when Name =:= ?MODULE; Name =:= codetracer_native_tracer ->
+    true;
+recorder_process({Name, Node}) when is_atom(Name), Node =:= node() ->
+    recorder_process(Name);
+recorder_process(Pid) when is_pid(Pid) ->
+    Pid =:= whereis(?MODULE) orelse Pid =:= whereis(codetracer_native_tracer);
+recorder_process(_Other) ->
+    false.
+
+write_program_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) ->
     {ThreadId, State1} = ensure_event_thread(File, Pid, State0),
     Metadata = source_metadata(Module, Function, length(Args), State1),
     {FrameId, State} = push_frame(Pid, Metadata, State1),
@@ -700,7 +733,7 @@ write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) 
     ],
     ok = file:write(File, Line),
     {ok, State};
-write_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, ReturnValue}, State0) ->
+write_program_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, ReturnValue}, State0) ->
     {ThreadId, State} = ensure_event_thread(File, Pid, State0),
     {FrameInfo, State1} = pop_frame(Pid, State),
     SourceLanguage = frame_source_language(FrameInfo),
@@ -719,7 +752,7 @@ write_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, R
     ok = file:write(File, Line),
     ok = write_drop_variables(File, Pid, ThreadId, FrameInfo),
     {ok, State1};
-write_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}, {Class, Reason}}, State0) ->
+write_program_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}, {Class, Reason}}, State0) ->
     {ThreadId, State} = ensure_event_thread(File, Pid, State0),
     {FrameInfo, State1} = pop_frame(Pid, State),
     SourceLanguage = frame_source_language(FrameInfo),
@@ -740,7 +773,7 @@ write_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}
     ok = file:write(File, Line),
     ok = write_drop_variables(File, Pid, ThreadId, FrameInfo),
     {ok, State1};
-write_trace_message(File, {trace, Pid, spawn, ChildPid, {Module, Function, Args}}, State0) ->
+write_program_trace_message(File, {trace, Pid, spawn, ChildPid, {Module, Function, Args}}, State0) ->
     {_ParentThreadId, State1} = ensure_event_thread(File, Pid, State0),
     {_ChildThreadId, State} = ensure_pid_thread(File, ChildPid, State1),
     Line = [
@@ -754,7 +787,7 @@ write_trace_message(File, {trace, Pid, spawn, ChildPid, {Module, Function, Args}
     ],
     ok = file:write(File, Line),
     {ok, State};
-write_trace_message(File, {trace, Pid, spawned, ParentPid, {Module, Function, Args}}, State0) ->
+write_program_trace_message(File, {trace, Pid, spawned, ParentPid, {Module, Function, Args}}, State0) ->
     {ThreadId, State} = ensure_event_thread(File, Pid, State0),
     Line = [
         "{\"event\":\"process_spawned\",",
@@ -768,7 +801,7 @@ write_trace_message(File, {trace, Pid, spawned, ParentPid, {Module, Function, Ar
     ],
     ok = file:write(File, Line),
     {ok, State};
-write_trace_message(File, {trace, Pid, exit, Reason}, State0) ->
+write_program_trace_message(File, {trace, Pid, exit, Reason}, State0) ->
     {ThreadId, State1} = ensure_event_thread(File, Pid, State0),
     PidText = pid_to_list(Pid),
     case maps:is_key(PidText, State1#state.exited_pids) of
@@ -786,7 +819,7 @@ write_trace_message(File, {trace, Pid, exit, Reason}, State0) ->
             ok = file:write(File, Line),
             {ok, State1#state{exited_pids = maps:put(PidText, true, State1#state.exited_pids)}}
     end;
-write_trace_message(File, {trace, Pid, send, Message, Recipient}, State0) ->
+write_program_trace_message(File, {trace, Pid, send, Message, Recipient}, State0) ->
     {SenderThreadId, State1} = ensure_event_thread(File, Pid, State0),
     {RecipientPidText, RecipientThreadId, State} = recipient_thread(File, Recipient, State1),
     ok = write_message_event(
@@ -800,7 +833,7 @@ write_trace_message(File, {trace, Pid, send, Message, Recipient}, State0) ->
         Message
     ),
     {ok, State};
-write_trace_message(File, {trace, Pid, send_to_non_existing_process, Message, Recipient}, State0) ->
+write_program_trace_message(File, {trace, Pid, send_to_non_existing_process, Message, Recipient}, State0) ->
     {SenderThreadId, State} = ensure_event_thread(File, Pid, State0),
     ok = write_message_event(
         File,
@@ -813,7 +846,7 @@ write_trace_message(File, {trace, Pid, send_to_non_existing_process, Message, Re
         Message
     ),
     {ok, State};
-write_trace_message(File, {trace, Pid, 'receive', Message, Sender}, State0) ->
+write_program_trace_message(File, {trace, Pid, 'receive', Message, Sender}, State0) ->
     {RecipientThreadId, State1} = ensure_event_thread(File, Pid, State0),
     {SenderPidText, SenderThreadId, State} = sender_thread(File, Sender, State1),
     ok = write_message_event(
@@ -827,7 +860,7 @@ write_trace_message(File, {trace, Pid, 'receive', Message, Sender}, State0) ->
         Message
     ),
     {ok, State};
-write_trace_message(File, {trace, Pid, 'receive', Message}, State0) ->
+write_program_trace_message(File, {trace, Pid, 'receive', Message}, State0) ->
     {RecipientThreadId, State} = ensure_event_thread(File, Pid, State0),
     ok = write_message_event(
         File,
@@ -840,7 +873,7 @@ write_trace_message(File, {trace, Pid, 'receive', Message}, State0) ->
         Message
     ),
     {ok, State};
-write_trace_message(_File, _Message, _State) ->
+write_program_trace_message(_File, _Message, _State) ->
     ignore.
 
 source_metadata(Module, Function, Arity, #state{manifest_index = ManifestIndex}) ->
@@ -1108,7 +1141,7 @@ write_message_event(
     RecipientThreadId,
     Message
 ) ->
-    {MessageRepr, MessageTruncated} = bounded_term(Message, 512),
+    {MessageRepr, MessageTruncated} = message_repr(Message, 512),
     Line = [
         "{\"event\":\"", Event, "\",",
         "\"schema\":\"codetracer.beam.message.v1\",",
@@ -1158,14 +1191,80 @@ tag_text(Value) when is_pid(Value) ->
 tag_text(_Value) ->
     "term".
 
-bounded_term(Value, Limit) ->
-    Text = lists:flatten(io_lib:format("~0tp", [Value])),
+%% The `message_repr' of a traced message: its text, cut at Limit characters,
+%% and whether it was cut. codetracer_native_tracer calls it too, so both
+%% tracer backends render a message the same way.
+message_repr(Message, Limit) ->
+    Text = lists:flatten(message_text(Message)),
     case length(Text) > Limit of
         true ->
             {string:substr(Text, 1, Limit), true};
         false ->
             {Text, false}
     end.
+
+%% A message's text is `~0tp' of the term, except inside an io request
+%% (https://www.erlang.org/doc/apps/stdlib/io_protocol.html): there the
+%% `Args' of a `put_chars' request that names a function are an argument
+%% list, never text, so they are written element by element. `~p' over the
+%% whole request takes a list of printable integers for a string, and prints
+%% the request `io:format("~p~n", [94])' sends as `["~p~n","^"]', turning the
+%% argument 94 into the character `^'. Every other request, and every other
+%% message, is `~0tp' of the whole term.
+message_text({io_request, From, ReplyAs, Request}) ->
+    ["{io_request,", term_text(From), ",", term_text(ReplyAs), ",",
+     io_request_text(Request), "}"];
+message_text(Message) ->
+    term_text(Message).
+
+io_request_text({put_chars, Encoding, Module, Function, Args}) ->
+    ["{put_chars,", term_text(Encoding), ",", term_text(Module), ",",
+     term_text(Function), ",", call_args_text(Module, Function, Args), "}"];
+%% The form without an encoding, which the protocol still defines.
+io_request_text({put_chars, Module, Function, Args}) ->
+    ["{put_chars,", term_text(Module), ",", term_text(Function), ",",
+     call_args_text(Module, Function, Args), "}"];
+io_request_text({requests, Requests}) when is_list(Requests) ->
+    case is_proper_list(Requests) of
+        true ->
+            ["{requests,[", lists:join(",", [io_request_text(R) || R <- Requests]), "]}"];
+        false ->
+            term_text({requests, Requests})
+    end;
+io_request_text(Request) ->
+    term_text(Request).
+
+%% `Args' are the arguments of the call Module:Function(...), so they are
+%% written as a list whatever their elements are. In the call io:format and
+%% io:fwrite request, `io_lib:format(Format, Arguments)', the second argument
+%% is the format's argument vector, a list as well, so it is written element
+%% by element too. Every argument, and every element of that vector, is
+%% `~0tp' of itself, as the program's own `~p' would print it. The arguments
+%% of any other function are not reinterpreted: what a list means to that
+%% function is not known here.
+call_args_text(io_lib, Function, [Format, Arguments])
+  when (Function =:= format orelse Function =:= fwrite), is_list(Arguments) ->
+    case is_proper_list(Arguments) of
+        true -> ["[", term_text(Format), ",", list_text(Arguments), "]"];
+        false -> list_text([Format, Arguments])
+    end;
+call_args_text(_Module, _Function, Args) when is_list(Args) ->
+    case is_proper_list(Args) of
+        true -> list_text(Args);
+        false -> term_text(Args)
+    end;
+call_args_text(_Module, _Function, Args) ->
+    term_text(Args).
+
+list_text(Elements) ->
+    ["[", lists:join(",", [term_text(Element) || Element <- Elements]), "]"].
+
+is_proper_list([]) -> true;
+is_proper_list([_ | Tail]) -> is_proper_list(Tail);
+is_proper_list(_) -> false.
+
+term_text(Value) ->
+    io_lib:format("~0tp", [Value]).
 
 join_json_strings([]) ->
     "";

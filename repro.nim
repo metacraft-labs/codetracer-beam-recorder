@@ -83,10 +83,12 @@
 ## runs ~11s unmonitored but ~60s under the shim), so even an edge running
 ## essentially alone can exceed the default 60000ms per-test budget. So
 ## (2) the thirteen MONITORED integration edges are additionally given a
-## generous 300000ms (5 min) per-test ExUnit timeout, set purely on the
+## generous 600000ms (10 min) per-test ExUnit timeout, set purely on the
 ## edge command via ``elixir -e`` (see the loop below) — the ``.exs`` test
-## files stay BYTE-IDENTICAL and the unmonitored ``just test`` path keeps
-## ExUnit's 60000ms default (it does not use this recipe). No test is
+## files stay BYTE-IDENTICAL, and ``just test-integration`` gives the same
+## suites the same budget the same way (``exunit_timeout_prelude`` in the
+## ``Justfile``), because CPU contention alone, with no shim, takes single
+## tests past 60000ms on a loaded runner. No test is
 ## skipped, relaxed, or removed; a broken assertion still fails FAST. The
 ## cheap edges — the fifteen
 ## ``verify-*-no-silent-skip.sh`` gates, the CLI smoke edge, and the cargo
@@ -182,17 +184,37 @@ package codetracer_beam_recorder:
     "pkg-config"
     "zstd"
 
+    # nimble resolves the Nim FFI's requirements through git.
+    "git"
+
     # POSIX shell — drives the golden-contract verification edge below,
     # the same ``bash tests/verify-golden-contract.sh`` step ``just test``
-    # runs (as ``test-goldens``) alongside ``cargo test``.
+    # runs (as ``test-goldens``) alongside ``cargo test``. Every shell
+    # edge runs its script with ``bash``; the scripts call the text and
+    # file tools listed after it, and the golden-contract script reads the
+    # fixtures with ``jq``.
     "sh"
+    "bash"
+    "jq"
+    "grep"
+    "sed"
+    "awk"
+    "cut"
+    "head"
+    "tail"
+    "cat"
+    "mkdir"
+    "mktemp"
+    "dirname"
+    "rm"
 
     # NB: the BEAM/OTP runtime (``erl`` / ``erlc`` / ``elixir`` / ``mix``
-    # / ``rebar3``) and ``jq`` are NOT declared here. Reprobuild resolves
-    # a ``uses:`` selector to a PATH binary of the SAME name; the OTP
-    # tools ship binaries named ``erl`` / ``elixir`` / … (there is no
-    # ``erlang`` binary), and reprobuild has no BEAM tool-edge to drive
-    # them through, so declaring them would only add a failing PATH probe.
+    # / ``rebar3``) is NOT declared here. The standard library's
+    # ``erlang`` and ``elixir`` packages provision Windows archives only,
+    # ``erlang`` maps to no ``erl`` executable (a PATH probe looks for an
+    # ``erlang`` binary, which OTP does not ship), and there is no
+    # ``mix`` / ``erlc`` / ``escript`` / ``rebar3`` package at all, so
+    # declaring them would only add a failing PATH probe.
     # These tools are runtime dependencies of the spawned cargo test
     # process (``tests/cli_test.rs`` ``e2e_*`` compile+record real Erlang
     # and Elixir programs), of the golden-contract shell script, and of
@@ -347,7 +369,7 @@ package codetracer_beam_recorder:
     # This removes cross-edge CPU contention but is necessary-not-sufficient
     # on its own (the dominant tip-over is monitor-shim overhead — see the
     # ExUnit-timeout note by the integration loop below, which raises the
-    # MONITORED edges' per-test budget to 5 min). NOTHING is skipped,
+    # MONITORED edges' per-test budget to 10 min). NOTHING is skipped,
     # relaxed, or removed. Mirrors FUP-E1
     # (``isonim.design-review-serial``) and ``nim_pty.pty-serial``. The
     # cheap gates (the fifteen ``verify-*-no-silent-skip.sh`` structural
@@ -398,7 +420,7 @@ package codetracer_beam_recorder:
     var beamEdges: seq[BuildActionDef] =
       @[elixirCanonicalFlow, erlangCanonicalFlow, cliSmoke]
 
-    # The fifteen live-BEAM Elixir integration suites. Each drives the
+    # The nineteen live-BEAM Elixir integration suites. Each drives the
     # recorder against a real BEAM VM and asserts on the produced CTFS
     # trace. ``function_trace_test`` is enrolled here (re-included in FUP-L
     # after its stale "completion order" call-ordering assertions were
@@ -406,7 +428,10 @@ package codetracer_beam_recorder:
     # the recorder was not touched — see the docstring).
     const beamIntegrationTests = [
       "ctfs_writer_bridge_test",
+      # JasonCompat's fallback JSON codec, the one OTP 26 uses (no `:json`).
+      "json_fallback_test",
       "runtime_session_test",
+      "launch_targets_test",
       "function_trace_test",
       "message_trace_test",
       "manifest_source_location_test",
@@ -428,7 +453,8 @@ package codetracer_beam_recorder:
       # served inside another on ONE process, so the session's per-pid
       # trace bookkeeping is exercised. Needs the same ``deps/`` fetch.
       "nested_requests_test",
-      "stress_event_volume_test"
+      "stress_event_volume_test",
+      "deep_call_nesting_test"
     ]
     # Per-test ExUnit timeout (ms) applied to the MONITORED integration
     # edges only. The reprobuild automatic monitor LD_PRELOADs the io-mon
@@ -441,19 +467,21 @@ package codetracer_beam_recorder:
     # they are just killed prematurely by a too-tight timeout under the
     # EXPECTED monitor overhead, so the serial pool above (which removes
     # cross-edge CPU contention) is necessary but not sufficient. We give
-    # the monitored edges a generous 5-minute budget so the shim's
+    # the monitored edges a generous 10-minute budget so the shim's
     # overhead cannot prematurely kill a correct, slow-under-monitor test.
     # This is NOT a weakening: a broken assertion still fails FAST (a
-    # failed assert never runs the clock out), and only the reprobuild
-    # edge is affected — the unmonitored ``just test`` path runs the same
-    # ``.exs`` files with ExUnit's built-in 60000ms default UNCHANGED (it
-    # does not go through this recipe). It is set purely on the EDGE
+    # failed assert never runs the clock out): only the budget changes,
+    # not what is asserted. ``just test-integration`` runs
+    # the same ``.exs`` files with the same budget, set the same way
+    # (``exunit_timeout_prelude`` in the ``Justfile``): unmonitored, CPU
+    # contention alone takes single tests past 60000ms on a loaded runner
+    # (measured on two contended cores: up to 268 s). It is set purely on the EDGE
     # COMMAND via ``elixir -e`` (the ``.exs`` files stay byte-identical):
     # the ``:ex_unit`` app is loaded first so its later ``ExUnit.start()``
     # app-load cannot clobber the value, then ``:timeout`` is put into the
     # app env BEFORE the required test file's ``ExUnit.start()`` reads it.
     # The underlying shim slowness is tracked as a separate follow-up.
-    const monitoredExUnitTimeoutMs = 300_000
+    const monitoredExUnitTimeoutMs = 600_000
     const exUnitTimeoutPrelude =
       "elixir -e 'Application.load(:ex_unit); " &
       "Application.put_env(:ex_unit, :timeout, " &
@@ -462,7 +490,7 @@ package codetracer_beam_recorder:
     for t in beamIntegrationTests:
       # Heavy live-BEAM edges → routed through the capacity-1 serial pool so
       # they do not race ExUnit's timeout under contention, AND given a
-      # raised (5 min) per-test ExUnit timeout so the ~5x monitor-shim
+      # raised (10 min) per-test ExUnit timeout so the ~5x monitor-shim
       # overhead cannot prematurely kill a correct, slow-under-monitor test.
       # RS-M8: the three web-span suites are recorded against real Hex
       # packages, so their edge fetches them first. Every other suite runs
@@ -489,7 +517,7 @@ package codetracer_beam_recorder:
           recorderDebugBinary],
         cacheable = false)
 
-    # The seventeen ``verify-*-no-silent-skip.sh`` structural gates: pure
+    # The nineteen ``verify-*-no-silent-skip.sh`` structural gates: pure
     # ``sh`` + ``grep`` assertions that the integration test files and
     # their Justfile wiring have not been gutted into no-ops. Cheap and
     # deterministic, so left cacheable (the default).
@@ -497,6 +525,7 @@ package codetracer_beam_recorder:
       "elixir-fixture-generation",
       "beam-fixture-generation",
       "runtime-session-test",
+      "launch-targets-test",
       "function-trace-test",
       "message-trace-test",
       "manifest-source-location-test",
@@ -509,11 +538,13 @@ package codetracer_beam_recorder:
       "plug-smoke-test",
       "plug-requests-test",
       "phoenix-requests-test",
+      "nested-requests-test",
       "stress-event-volume-test",
       "release-check"
     ]
+    var gateEdges: seq[BuildActionDef] = @[]
     for g in beamNoSilentSkipGates:
-      beamEdges.add shell(
+      gateEdges.add shell(
         command = "bash tests/verify-" & g & "-no-silent-skip.sh",
         actionId = "codetracer-beam-recorder.verify-" & g & "-no-silent-skip",
         extraInputs = @[
@@ -521,4 +552,38 @@ package codetracer_beam_recorder:
           "tests/integration", "tests/fixtures", "scripts",
           "test-programs", "repro.nim", "Justfile"])
 
-    discard collect("test", @[testsRun.action, goldenVerify] & beamEdges)
+    # ---- Tool identities --------------------------------------------
+    #
+    # A typed-tool wrapper attaches only its own tool's identity to the
+    # action it registers, and ``sh.shell`` / ``pooledShell`` attach none,
+    # so every tool an edge's process tree runs is attached here, from the
+    # ``uses:`` declarations above. Without them the tools' versions never
+    # reach the actions' cache keys, and under typed provisioning the tools
+    # are not on the actions' PATH at all.
+    #
+    # Attaching an identity also narrows the action's PATH to the attached
+    # tools. That is why the edges that run the BEAM toolchain -- the cargo
+    # test run (``tests/cli_test.rs`` compiles and records real Erlang and
+    # Elixir programs), the two canonical-flow fixtures and the live-BEAM
+    # integration suites -- carry none yet: ``erl`` / ``erlc`` / ``elixir``
+    # / ``mix`` / ``rebar3`` cannot be declared (see the note at the end of
+    # ``uses:``), so those edges still take every tool from the dev-shell
+    # PATH, and attaching only the declarable ones would hide the BEAM
+    # toolchain from them.
+    const cargoToolRefs = ["cargo", "rustc", "nim", "nimble", "git", "capnp",
+                           "pkg-config", "zstd"]
+    const shellToolRefs = ["sh", "bash", "grep", "sed", "awk", "cut", "head",
+                           "tail", "cat", "mkdir", "mktemp", "dirname", "rm"]
+    for action in [recorderBuild.id, recorderDebugBuild.id,
+                   testsBuild.action.id]:
+      appendRegisteredActionToolIdentityRefs(action, cargoToolRefs)
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(action, ["gcc"])
+      elif defined(macosx):
+        appendRegisteredActionToolIdentityRefs(action, ["clang"])
+    for action in @[goldenVerify, cliSmoke] & gateEdges:
+      appendRegisteredActionToolIdentityRefs(action.id, shellToolRefs)
+    appendRegisteredActionToolIdentityRefs(goldenVerify.id, ["jq"])
+
+    discard collect("test",
+      @[testsRun.action, goldenVerify] & beamEdges & gateEdges)

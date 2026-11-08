@@ -600,6 +600,14 @@ fn record_rebar3_profile(
 }
 
 fn record_erlang_canonical_function(label: &str, function: &str) -> RecordedTrace {
+    record_erlang_canonical_function_with_env(label, function, &[])
+}
+
+fn record_erlang_canonical_function_with_env(
+    label: &str,
+    function: &str,
+    env: &[(&str, &str)],
+) -> RecordedTrace {
     let tmp = temp_dir(label);
     let out_dir = tmp.join("trace");
     let fixture_dir = repo_root().join("test-programs/erlang/canonical_flow");
@@ -625,6 +633,7 @@ fn record_erlang_canonical_function(label: &str, function: &str) -> RecordedTrac
         ])
         .current_dir(&fixture_dir)
         .env("TMPDIR", tmp.to_str().unwrap())
+        .envs(env.iter().copied())
         .output()
         .expect("run Erlang canonical fixture under runtime session");
 
@@ -1919,19 +1928,247 @@ fn e2e_runtime_records_real_exception_fixture() {
     );
 
     let reader = open_mix_trace(&recorded.out_dir);
-    let event_jsons = (0..reader.event_count())
+    let raw_events = (0..reader.event_count())
+        .map(|index| reader.event_json(index).expect("read event json"))
+        .collect::<Vec<_>>();
+    // The reader reports each event's exact `EventLogKind` by its spec name
+    // (trace-events.md §"EventLogKind (u8 enum)"); an uncaught exception is
+    // `Error` (ordinal 11).
+    assert!(
+        raw_events.iter().any(|raw| {
+            let kind = serde_json::from_str::<Value>(raw)
+                .ok()
+                .and_then(|value| value.get("kind").and_then(Value::as_str).map(str::to_owned));
+            let content = decode_reader_event_content(raw);
+            kind.as_deref() == Some("Error")
+                && content.contains("codetracer.elixir.exception_from.v1")
+                && content.contains("Elixir.CanonicalFlow")
+                && content.contains("m5 fixture exception")
+        }),
+        "reader should expose exception_from as an `Error` event with schema metadata: {raw_events:#?}"
+    );
+}
+
+/// Each recorded event carries the `EventLogKind` the spec assigns to it
+/// (trace-events.md §"EventLogKind (u8 enum)"): stdout is `Write`, stderr is
+/// `WriteStderr`, and a message the recorder itself logs into the trace is
+/// `TraceLogEvent`.
+#[test]
+fn e2e_runtime_records_output_streams_and_diagnostics_under_their_spec_kinds() {
+    let recorded = record_elixir_expression(
+        "output-stream-kinds",
+        "CanonicalFlow.main(); IO.puts(\"beam-stdout-line\"); IO.puts(:stderr, \"beam-stderr-line\")",
+    );
+    assert_success(&recorded.output, "record stdout/stderr expression");
+
+    let reader = open_mix_trace(&recorded.out_dir);
+    let events = (0..reader.event_count())
         .map(|index| {
-            decode_reader_event_content(&reader.event_json(index).expect("read event json"))
+            let raw = reader.event_json(index).expect("read event json");
+            let kind = serde_json::from_str::<Value>(&raw)
+                .ok()
+                .and_then(|value| value.get("kind").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default();
+            let metadata = String::from_utf8_lossy(
+                &reader.event_metadata(index).expect("read event metadata"),
+            )
+            .into_owned();
+            (kind, metadata, decode_reader_event_content(&raw))
         })
         .collect::<Vec<_>>();
-    assert!(
-        event_jsons.iter().any(|event| {
-            event.contains("codetracer.elixir.exception_from.v1")
-                && event.contains("Elixir.CanonicalFlow")
-                && event.contains("m5 fixture exception")
-        }),
-        "reader should expose exception_from as Error event with schema metadata: {event_jsons:#?}"
+    let kind_of = |metadata: &str, content: &str| {
+        events
+            .iter()
+            .filter(|(_, meta, text)| meta == metadata && text.contains(content))
+            .map(|(kind, _, _)| kind.clone())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        kind_of("stdout", "beam-stdout-line"),
+        vec!["Write".to_string()],
+        "stdout output must be recorded once as `Write`: {events:#?}"
     );
+    assert_eq!(
+        kind_of("stderr", "beam-stderr-line"),
+        vec!["WriteStderr".to_string()],
+        "stderr output must be recorded once as `WriteStderr`: {events:#?}"
+    );
+    assert_eq!(
+        kind_of("m4", "runtime_session delivered="),
+        vec!["TraceLogEvent".to_string()],
+        "the recorder's own runtime-session note is a logged message, not program output: {events:#?}"
+    );
+}
+
+/// What an Erlang program prints with `io:format` is recorded as terminal
+/// output (`Write`), exactly as it is for Elixir: the canonical Erlang
+/// fixture prints `94` with `io:format("~p~n", [Result])`, and the replayed
+/// trace must carry that line. Regression for codetracer-pm issue
+/// 2026-11-04-erlang-io-format-output-is-not-recorded-as-terminal-output.
+#[test]
+fn e2e_runtime_records_erlang_io_format_output_as_write() {
+    let recorded = record_erlang_canonical_function("erlang-io-format-write", "main");
+    assert_success(&recorded.output, "record Erlang canonical_flow:main");
+    assert_eq!(String::from_utf8_lossy(&recorded.output.stdout), "94\n");
+
+    let reader = open_named_trace(&recorded.out_dir, "erl.ct");
+    let writes = (0..reader.event_count())
+        .filter_map(|index| {
+            let raw = reader.event_json(index).expect("read event json");
+            let kind = serde_json::from_str::<Value>(&raw)
+                .ok()
+                .and_then(|value| value.get("kind").and_then(Value::as_str).map(str::to_owned))?;
+            (kind == "Write").then(|| decode_reader_event_content(&raw))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        writes,
+        vec!["94".to_string()],
+        "io:format output must be recorded once as `Write` carrying `94`"
+    );
+}
+
+/// The io request `io:format("~p~n", [94])` sends carries the argument list
+/// `[94]`; its `message_repr` writes it as that list, not as the charlist
+/// `"^"` (code point 94) that `~p` over the whole request prints. Both
+/// tracer backends render messages through `codetracer_session:message_repr`,
+/// so both are checked. Regression for codetracer-pm issue
+/// 2026-11-04-erlang-io-format-output-is-not-recorded-as-terminal-output.
+#[test]
+fn e2e_runtime_renders_io_format_arguments_as_a_list() {
+    for backend in ["process", "native"] {
+        let recorded = record_erlang_canonical_function_with_env(
+            &format!("erlang-io-request-repr-{backend}"),
+            "main",
+            &[("CODETRACER_BEAM_RECORDER_TRACER_BACKEND", backend)],
+        );
+        assert_success(
+            &recorded.output,
+            &format!("record canonical_flow:main ({backend})"),
+        );
+
+        let events = runtime_sidecar_events(&recorded.out_dir);
+        let io_requests = sidecar_message_events(&events)
+            .into_iter()
+            .filter(|event| event["direction"] == "send" && event["tag"] == "io_request")
+            .filter_map(|event| event["message_repr"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert!(
+            !io_requests.is_empty(),
+            "{backend}: the io:format call must be captured as an io_request send: {events:#?}"
+        );
+        assert!(
+            io_requests
+                .iter()
+                .all(|repr| repr.ends_with(",{put_chars,unicode,io_lib,format,[\"~p~n\",[94]]}}")),
+            "{backend}: the io_request's argument list must render as [94]: {io_requests:#?}"
+        );
+    }
+}
+
+/// `codetracer_session:message_repr/2` over every io request shape of the
+/// I/O protocol (https://www.erlang.org/doc/apps/stdlib/io_protocol.html),
+/// called in a real VM on the runtime as the recorder compiles it. A
+/// recording only produces the one shape `io:format` sends, so the others
+/// are checked here: the encoding-less `put_chars`, `io_lib:fwrite`, format
+/// arguments that are strings, other functions' argument lists, characters,
+/// `requests`, improper lists, non-output requests, plain messages, and the
+/// truncation flag. From and ReplyAs are atoms so the text is deterministic.
+#[test]
+fn e2e_runtime_message_repr_renders_every_io_request_shape() {
+    let tmp = temp_dir("message-repr-shapes");
+    let ebin_dir = tmp.join("runtime-ebin");
+    compile_erlang_sources(
+        &repo_root().join("apps/codetracer_erlang_runtime/src"),
+        &ebin_dir,
+    );
+
+    let cases: &[(&str, &str)] = &[
+        (
+            r#"{io_request,from,ref,{put_chars,unicode,io_lib,format,["~p~n",[94]]}}"#,
+            r#"{io_request,from,ref,{put_chars,unicode,io_lib,format,["~p~n",[94]]}}|false"#,
+        ),
+        (
+            r#"{io_request,from,ref,{put_chars,io_lib,fwrite,["~w~n",[65,66]]}}"#,
+            r#"{io_request,from,ref,{put_chars,io_lib,fwrite,["~w~n",[65,66]]}}|false"#,
+        ),
+        (
+            r#"{io_request,from,ref,{put_chars,unicode,io_lib,format,["~s ~p~n",["name",[1,2]]]}}"#,
+            r#"{io_request,from,ref,{put_chars,unicode,io_lib,format,["~s ~p~n",["name",[1,2]]]}}|false"#,
+        ),
+        (
+            r#"{io_request,from,ref,{put_chars,unicode,my_mod,render,[65]}}"#,
+            r#"{io_request,from,ref,{put_chars,unicode,my_mod,render,[65]}}|false"#,
+        ),
+        (
+            r#"{io_request,from,ref,{put_chars,unicode,my_mod,render,[id,"text"]}}"#,
+            r#"{io_request,from,ref,{put_chars,unicode,my_mod,render,[id,"text"]}}|false"#,
+        ),
+        (
+            r#"{io_request,from,ref,{put_chars,unicode,<<"94\n">>}}"#,
+            r#"{io_request,from,ref,{put_chars,unicode,<<"94\n">>}}|false"#,
+        ),
+        (
+            r#"{io_request,from,ref,{requests,[{put_chars,unicode,io_lib,format,["~p",[94]]},{put_chars,unicode,"x"}]}}"#,
+            r#"{io_request,from,ref,{requests,[{put_chars,unicode,io_lib,format,["~p",[94]]},{put_chars,unicode,"x"}]}}|false"#,
+        ),
+        (
+            r#"{io_request,from,ref,{put_chars,unicode,io_lib,format,["~p",[94|tail]]}}"#,
+            r#"{io_request,from,ref,{put_chars,unicode,io_lib,format,["~p",[94|tail]]}}|false"#,
+        ),
+        (
+            r#"{io_request,from,ref,{put_chars,unicode,io_lib,format,["~p"|tail]}}"#,
+            r#"{io_request,from,ref,{put_chars,unicode,io_lib,format,["~p"|tail]}}|false"#,
+        ),
+        (
+            r#"{io_request,from,ref,{get_line,unicode,"> "}}"#,
+            r#"{io_request,from,ref,{get_line,unicode,"> "}}|false"#,
+        ),
+        // Outside an io request a message is `~0tp` of the whole term, so a
+        // list of printable integers still reads as a string there.
+        (r#"{hello,[94]}"#, r#"{hello,"^"}|false"#),
+    ];
+
+    let messages = cases
+        .iter()
+        .map(|(message, _)| *message)
+        .collect::<Vec<_>>()
+        .join(",");
+    let expression = format!(
+        "Show = fun(Message, Limit) -> \
+             {{Text, Truncated}} = codetracer_session:message_repr(Message, Limit), \
+             io:format(\"~ts|~p~n\", [Text, Truncated]) \
+         end, \
+         Messages = [{messages}], \
+         lists:foreach(fun(Message) -> Show(Message, 512) end, Messages), \
+         Show(hd(Messages), 20), \
+         halt()."
+    );
+    let output = Command::new("erl")
+        .args([
+            "-noshell",
+            "-pa",
+            ebin_dir.to_str().unwrap(),
+            "-eval",
+            &expression,
+        ])
+        .output()
+        .expect("run erl over codetracer_session:message_repr/2");
+    assert_success(
+        &output,
+        "codetracer_session:message_repr/2 over io request shapes",
+    );
+
+    let mut expected = cases
+        .iter()
+        .map(|(_, rendered)| rendered.to_string())
+        .collect::<Vec<_>>();
+    // The first message cut at 20 characters, and flagged as cut.
+    expected.push("{io_request,from,ref|true".to_string());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), expected);
 }
 
 #[test]
@@ -3488,6 +3725,75 @@ fn e2e_elixir_protocol_macro_behaviour_matrix() {
     assert_raw_elixir_value(&values, "final_total", "final integer total", |value| {
         matches!(value, ValueRecord::Int { i: 549, .. })
     });
+}
+
+fn source_map_file_names(out_dir: &Path) -> Vec<String> {
+    let root = out_dir.join("recorder_metadata/source_maps");
+    let mut names = fs::read_dir(&root)
+        .unwrap_or_else(|error| panic!("read {}: {error}", root.display()))
+        .map(|entry| {
+            entry
+                .expect("source-map entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+/// A Mix build's generated Erlang (here a `@derive` protocol implementation)
+/// lives in the build directory, outside the project. Its source-map artifact
+/// must be named from its place in the build directory, not from the absolute
+/// path: the name is then the same wherever the build directory is, and a
+/// deep build directory cannot push it past the file-name length limit.
+#[test]
+fn e2e_elixir_source_map_names_do_not_depend_on_the_build_dir_location() {
+    let short = record_mix_task_eval(
+        "m15-srcmap-short",
+        "protocol_macro_behaviour",
+        "ProtocolMacroBehaviour.main()",
+        &[],
+    );
+    assert_eq!(
+        short.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&short.output)
+    );
+
+    // 120 more bytes of build-directory path than the recording above.
+    let deep_label = format!("m15-srcmap-deep-{}", "d".repeat(120));
+    let deep = record_mix_task_eval(
+        &deep_label,
+        "protocol_macro_behaviour",
+        "ProtocolMacroBehaviour.main()",
+        &[],
+    );
+    assert_eq!(
+        deep.output.status.code(),
+        Some(0),
+        "a deep build directory must not make the recording fail: {}",
+        output_text(&deep.output)
+    );
+
+    let short_names = source_map_file_names(&short.out_dir);
+    let deep_names = source_map_file_names(&deep.out_dir);
+    assert!(
+        short_names.iter().any(|name| name.contains("DerivedItem")),
+        "the generated @derive implementation should have a source map: {short_names:#?}"
+    );
+    for name in &short_names {
+        assert!(
+            !name.contains("m15-srcmap-short"),
+            "source-map name {name} embeds the build directory's location"
+        );
+    }
+    assert_eq!(
+        short_names, deep_names,
+        "source-map names must not depend on where the build directory is"
+    );
 }
 
 #[test]

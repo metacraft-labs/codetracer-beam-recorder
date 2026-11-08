@@ -7,10 +7,12 @@ use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus};
 
+use codetracer_ctfs::CtfsReader;
 use codetracer_trace_types::{
     EventLogKind, FieldTypeRecord, FunctionId, Line, TypeId, TypeKind, TypeSpecificInfo,
     ValueRecord,
 };
+use codetracer_trace_writer::meta_dat::{read_meta_dat_flags, FLAG_HAS_SPAN_STREAM};
 use codetracer_trace_writer_nim::{
     read_span_stream_json, NimTraceReaderHandle, NimTraceWriter, SpanRecord,
     TraceEventsFileFormat as NimFormat, SPAN_STATUS_ERROR, SPAN_STATUS_OK, SPAN_STATUS_UNKNOWN,
@@ -410,7 +412,8 @@ fn batch_command(batch: &Path, args: &[String], envs: &[(String, String)]) -> Co
 /// The recorder forwards both streams to its own, byte for byte, so a
 /// recorded run still looks and behaves exactly like an unrecorded one —
 /// and keeps a copy, which `RecordingSession::finish` writes into the trace
-/// as `EventLogKind::Write` events. Without this the trace would describe
+/// as `EventLogKind::Write` (stdout) and `EventLogKind::WriteStderr` (stderr)
+/// events. Without this the trace would describe
 /// the program's control flow but none of its OUTPUT, and "did this run
 /// really produce that line?" would be unanswerable from the trace alone.
 ///
@@ -1307,7 +1310,7 @@ impl RecordingSession {
         }
         self.write_recorded_output(recorded_output);
         self.writer.register_special_event(
-            EventLogKind::Write,
+            EventLogKind::TraceLogEvent,
             "m4",
             &format!(
                 "runtime_session delivered={} injection={}",
@@ -1328,8 +1331,10 @@ impl RecordingSession {
             .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
     }
 
-    /// Record what the program wrote, one `EventLogKind::Write` event per
-    /// line, so the trace answers "what did this run print?" on its own.
+    /// Record what the program wrote, one event per line, so the trace
+    /// answers "what did this run print?" on its own. Each stream gets the
+    /// kind trace-events.md §"EventLogKind (u8 enum)" assigns it: stdout is
+    /// `Write`, stderr is `WriteStderr`. The metadata slot names the stream.
     ///
     /// The events are appended after the runtime's own trace events rather
     /// than interleaved with them: the recorder observes the child's pipes
@@ -1342,14 +1347,16 @@ impl RecordingSession {
     /// `\n` while stripping a trailing `\r`, so CRLF output loses its `\r`.
     /// The bytes forwarded to the terminal are unaffected.
     fn write_recorded_output(&mut self, output: &RecordedOutput) {
-        for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        for (stream, kind, bytes) in [
+            ("stdout", EventLogKind::Write, &output.stdout),
+            ("stderr", EventLogKind::WriteStderr, &output.stderr),
+        ] {
             if bytes.is_empty() {
                 continue;
             }
             let text = String::from_utf8_lossy(bytes);
             for line in text.lines() {
-                self.writer
-                    .register_special_event(EventLogKind::Write, stream, line);
+                self.writer.register_special_event(kind, stream, line);
             }
         }
     }
@@ -1373,12 +1380,14 @@ impl RecordingSession {
         let mut open_web_spans: BTreeMap<u64, OpenWebRequestSpan> = BTreeMap::new();
         let mut settled_web_spans: Vec<RecordedWebRequestSpan> = Vec::new();
         let mut thread_switch_points: Vec<(u64, u64)> = Vec::new();
+        let mut current_thread = RUNTIME_THREAD_ID;
         for event in &runtime_result.trace_events {
             match event {
                 RuntimeTraceEvent::ThreadStart { thread_id, .. } => {
                     self.writer.register_thread_start(*thread_id);
                 }
                 RuntimeTraceEvent::ThreadSwitch { thread_id, .. } => {
+                    current_thread = *thread_id;
                     thread_switch_points.push((self.writer.next_step_index(), *thread_id));
                     self.writer.register_thread_switch(*thread_id);
                 }
@@ -1441,6 +1450,20 @@ impl RecordingSession {
                             "runtime emitted step for unknown location_id {location_id}"
                         )));
                     };
+                    // Scheduler markers before the handler are not a seek
+                    // target. Bind each pending span to its first executable
+                    // source location on its own process, skipping generated
+                    // compiler scaffolding with no original-source mapping.
+                    if !location.generated
+                        && location.resolution_strategy != "unknown_generated_fallback"
+                    {
+                        for open in open_web_spans.values_mut() {
+                            if open.thread_id == current_thread && !open.has_handler_step {
+                                open.start_step = self.writer.next_step_index();
+                                open.has_handler_step = true;
+                            }
+                        }
+                    }
                     self.writer.register_step(
                         &location.resolved_source_path,
                         Line(location.resolved_line),
@@ -1547,10 +1570,8 @@ impl RecordingSession {
                     wall_ns,
                     metadata,
                 } => {
-                    // The runtime wrote a `thread_switch` for this process
-                    // immediately before this marker, so the writer's current
-                    // thread is already the request's and the next exec index
-                    // is the first event that belongs to the request.
+                    // Keep the opening boundary until the first mapped
+                    // handler step arrives on this request's own thread.
                     open_web_spans.insert(
                         *span_id,
                         OpenWebRequestSpan {
@@ -1559,6 +1580,7 @@ impl RecordingSession {
                             pid: pid.clone(),
                             start_wall_ns: *wall_ns,
                             start_step: self.writer.next_step_index(),
+                            has_handler_step: false,
                             metadata: metadata.clone(),
                         },
                     );
@@ -2031,6 +2053,7 @@ struct OpenWebRequestSpan {
     pid: String,
     start_wall_ns: u64,
     start_step: u64,
+    has_handler_step: bool,
     metadata: Vec<(String, String)>,
 }
 
@@ -2082,6 +2105,10 @@ fn web_request_metadata(
     for (key, value) in [
         ("beam.pid".to_string(), open.pid.clone()),
         ("beam.thread_id".to_string(), open.thread_id.to_string()),
+        (
+            "beam.handler_step_available".to_string(),
+            open.has_handler_step.to_string(),
+        ),
     ] {
         match metadata.iter_mut().find(|(existing, _)| *existing == key) {
             Some(slot) => slot.1 = value,
@@ -2230,6 +2257,44 @@ impl RuntimeSession {
                     .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
                 return Self::prepare_from_standalone_build(options, &build_dir);
             }
+        }
+        // A plain `record -- mix run` must use the same Elixir abstract-forms
+        // pipeline as `mix compile.codetracer`; source scanning alone gives
+        // call records but no executable handler steps to seek to.
+        if mode == RuntimeMode::Beam && target_program_name(&options.target[0]) == "mix" {
+            let build_dir = options.out_dir.join("mix_build");
+            let source_map = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("lib/codetracer_beam_recorder/elixir_source_map.ex");
+            let patterns = |values: &[String]| {
+                format!(
+                    "[{}]",
+                    values
+                        .iter()
+                        .map(|value| elixir_string(value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let expression = format!(
+                "Code.require_file({source_map}); CodetracerBeamRecorder.ElixirSourceMap.build_mix_project(build_dir: {build_dir}, include_modules: {include}, exclude_modules: {exclude})",
+                source_map = elixir_string(&source_map.display().to_string()),
+                build_dir = elixir_string(&build_dir.display().to_string()),
+                include = patterns(&options.include_modules),
+                exclude = patterns(&options.exclude_modules),
+            );
+            let output = run_beam_tool(
+                &options.target[0],
+                &["run", "--no-start", "--no-compile", "-e", &expression],
+            )
+            .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+            if !output.status.success() {
+                return Err(RecorderDiagnostic::compile_failed(format!(
+                    "Mix instrumentation failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                )));
+            }
+            return Self::prepare_from_standalone_build(options, &build_dir);
         }
         let source_paths = if mode == RuntimeMode::Beam {
             discover_source_paths(&source_root)
@@ -2397,6 +2462,20 @@ impl RuntimeSession {
                 "missing compiled runtime ebin directory",
             ));
         };
+        // Keep configuration out of argv: the function/source/manifest lists
+        // can exceed Linux's per-argument limit even for ordinary projects.
+        // Both Erlang and Elixir consult this same complete Erlang term.
+        let options_path = self.runtime_options_path();
+        fs::write(
+            &options_path,
+            format!("{}.\n", erlang_runtime_options(self)),
+        )
+        .map_err(|error| {
+            RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                "failed to write runtime options at {}: {error}",
+                options_path.display()
+            ))
+        })?;
         let command_name = target_program_name(&target[0]);
         let mut prepared = match command_name.as_str() {
             "mix" => self.prepare_mix_target(target, runtime_ebin),
@@ -2412,6 +2491,10 @@ impl RuntimeSession {
         }?;
         prepared.env.extend(value_limit_env(&options.value_limits));
         Ok(prepared)
+    }
+
+    fn runtime_options_path(&self) -> PathBuf {
+        self.session_file.with_file_name("runtime_options.term")
     }
 
     fn prepare_mix_target(
@@ -3880,7 +3963,7 @@ fn compile_runtime_app_with(
     let src_dir = repo_root.join("apps/codetracer_erlang_runtime/src");
     let build_dir = out_dir.join("runtime").join(RUNTIME_APP_NAME);
     let ebin_dir = build_dir.join("ebin");
-    fs::create_dir_all(&ebin_dir)?;
+    fs::create_dir_all(&ebin_dir).map_err(at_path(&ebin_dir))?;
 
     for module in [
         "codetracer_erlang_runtime.erl",
@@ -3903,10 +3986,9 @@ fn compile_runtime_app_with(
         }
     }
 
-    fs::copy(
-        src_dir.join(format!("{RUNTIME_APP_NAME}.app.src")),
-        ebin_dir.join(format!("{RUNTIME_APP_NAME}.app")),
-    )?;
+    let app_src = src_dir.join(format!("{RUNTIME_APP_NAME}.app.src"));
+    fs::copy(&app_src, ebin_dir.join(format!("{RUNTIME_APP_NAME}.app")))
+        .map_err(at_path(&app_src))?;
     Ok(ebin_dir)
 }
 
@@ -3940,7 +4022,33 @@ fn run_beam_tool(program: &str, args: &[&str]) -> io::Result<std::process::Outpu
         .as_deref()
         .map(|p| p.as_os_str())
         .unwrap_or_else(|| program.as_ref());
-    Command::new(program_os).args(args).output()
+    Command::new(program_os)
+        .args(args)
+        .output()
+        .map_err(|error| spawn_error(program, resolved.as_deref(), error))
+}
+
+/// A BEAM tool that could not be started, named. The OS error alone ("No such
+/// file or directory") says neither which program was missing nor where it was
+/// looked up, which leaves a failed recording untraceable. The error kind is
+/// kept so callers that branch on it still can.
+fn spawn_error(program: &str, resolved: Option<&Path>, error: io::Error) -> io::Error {
+    let looked_up = match resolved {
+        Some(path) => format!("resolved to {}", path.display()),
+        None => format!(
+            "not found on PATH={}",
+            env::var("PATH").unwrap_or_else(|_| "<unset>".to_string())
+        ),
+    };
+    io::Error::new(
+        error.kind(),
+        format!("failed to run `{program}` ({looked_up}): {error}"),
+    )
+}
+
+/// Attach the path an I/O step was operating on to its error, keeping the kind.
+fn at_path(path: &Path) -> impl FnOnce(io::Error) -> io::Error + '_ {
+    move |error| io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }
 
 fn compile_erlang_runtime_source(
@@ -5137,11 +5245,11 @@ fn wrap_elixir_expression(expression: &str, runtime: &RuntimeSession) -> String 
     // of quoting. `;` is an equivalent Elixir statement separator and
     // `try do … after … end` is valid inline.
     format!(
-        ":code.add_patha({runtime_ebin}); {instrumented_path}{purge_modules}:ok = :codetracer_erlang_runtime.start_session({options}); try do {expression} after :ok = :codetracer_erlang_runtime.stop_session(:normal) end",
+        ":code.add_patha({runtime_ebin}); {instrumented_path}{{:ok, [ct_runtime_options]}} = :file.consult({options_path}); {purge_modules}:ok = :codetracer_erlang_runtime.start_session(ct_runtime_options); try do {expression} after :ok = :codetracer_erlang_runtime.stop_session(:normal) end",
         runtime_ebin = runtime_ebin,
         instrumented_path = instrumented_path,
-        purge_modules = elixir_purge_trace_modules(&runtime.trace_functions),
-        options = elixir_runtime_options(runtime)
+        purge_modules = "ct_runtime_options |> Keyword.fetch!(:trace_functions) |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> Enum.each(fn ct_module -> :code.purge(ct_module); :code.delete(ct_module) end); ",
+        options_path = elixir_charlist(&runtime.runtime_options_path().display().to_string())
     )
 }
 
@@ -5157,8 +5265,8 @@ fn wrap_erlang_entrypoint(
     runtime: &RuntimeSession,
 ) -> String {
     format!(
-        "codetracer_erlang_runtime:start_session({options}), try apply({module}, {function}, {args}) of _ -> codetracer_erlang_runtime:stop_session(normal), halt(0) catch Class:Reason:Stack -> codetracer_erlang_runtime:stop_session({{Class,Reason}}), erlang:raise(Class, Reason, Stack) end.",
-        options = erlang_runtime_options(runtime),
+        "{{ok,[CTRuntimeOptions]}} = file:consult({options_path}), codetracer_erlang_runtime:start_session(CTRuntimeOptions), try apply({module}, {function}, {args}) of _ -> codetracer_erlang_runtime:stop_session(normal), halt(0) catch Class:Reason:Stack -> codetracer_erlang_runtime:stop_session({{Class,Reason}}), erlang:raise(Class, Reason, Stack) end.",
+        options_path = erlang_string(&runtime.runtime_options_path().display().to_string()),
         module = erlang_atom(module),
         function = erlang_atom(function),
         args = args_literal
@@ -5176,18 +5284,18 @@ fn wrap_rebar3_shell_eval(expression: &str, runtime: &RuntimeSession) -> String 
         .as_ref()
         .map(|path| {
             format!(
-                "code:add_patha({}),{}",
-                erlang_string(&path.display().to_string()),
-                erlang_purge_trace_modules(&runtime.trace_functions)
+                "code:add_patha({}),",
+                erlang_string(&path.display().to_string())
             )
         })
         .unwrap_or_default();
     let expression = erlang_eval_expression_body(expression);
     format!(
-        "code:add_patha({runtime_ebin}),{instrumented_path}codetracer_erlang_runtime:start_session({options}), try begin {expression} end of _ -> codetracer_erlang_runtime:stop_session(normal), halt(0) catch Class:Reason:Stack -> codetracer_erlang_runtime:stop_session({{Class,Reason}}), erlang:raise(Class, Reason, Stack) end.",
+        "code:add_patha({runtime_ebin}),{instrumented_path}{{ok,[CTRuntimeOptions]}} = file:consult({options_path}), {purge_modules}codetracer_erlang_runtime:start_session(CTRuntimeOptions), try begin {expression} end of _ -> codetracer_erlang_runtime:stop_session(normal), halt(0) catch Class:Reason:Stack -> codetracer_erlang_runtime:stop_session({{Class,Reason}}), erlang:raise(Class, Reason, Stack) end.",
         runtime_ebin = runtime_ebin,
         instrumented_path = instrumented_path,
-        options = erlang_runtime_options(runtime),
+        purge_modules = "lists:foreach(fun(CTModule) -> code:purge(CTModule), code:delete(CTModule) end, lists:usort([element(1, CTFun) || CTFun <- proplists:get_value(trace_functions, CTRuntimeOptions, [])])),",
+        options_path = erlang_string(&runtime.runtime_options_path().display().to_string()),
         expression = expression
     )
 }
@@ -5199,35 +5307,6 @@ fn erlang_eval_expression_body(expression: &str) -> String {
         .unwrap_or_else(|| expression.trim())
         .trim()
         .to_string()
-}
-
-fn elixir_runtime_options(runtime: &RuntimeSession) -> String {
-    let mut extras = String::new();
-    extras.push_str(&format!(
-        ", {{:tracer_backend, :{}}}",
-        runtime.tracer_backend.as_str()
-    ));
-    if let Some(limit) = runtime.tracer_queue_limit {
-        extras.push_str(&format!(", {{:queue_limit, {limit}}}"));
-    }
-    if let Some(policy) = runtime.tracer_overflow_policy {
-        extras.push_str(&format!(", {{:overflow_policy, :{}}}", policy.as_str()));
-    }
-    format!(
-        "[{{:session_file, {session_file}}}, {{:source_paths, {source_paths}}}, {{:manifest_paths, {manifest_paths}}}, {{:trace_functions, {trace_functions}}}, {{:capture_messages, {capture_messages}}}{extras}]",
-        session_file = elixir_charlist(&runtime.session_file.display().to_string()),
-        source_paths = elixir_charlist_list(&runtime.source_paths),
-        manifest_paths = elixir_string_list(
-            &runtime
-                .manifests
-                .iter()
-                .map(|manifest| manifest.runtime_path.clone())
-                .collect::<Vec<_>>()
-        ),
-        trace_functions = elixir_trace_function_list(&runtime.trace_functions),
-        capture_messages = runtime.capture_messages,
-        extras = extras
-    )
 }
 
 fn erlang_runtime_options(runtime: &RuntimeSession) -> String {
@@ -5259,52 +5338,6 @@ fn erlang_runtime_options(runtime: &RuntimeSession) -> String {
     )
 }
 
-fn elixir_charlist_list(paths: &[PathBuf]) -> String {
-    let values = paths
-        .iter()
-        .map(|path| elixir_charlist(&path.display().to_string()))
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(", "))
-}
-
-fn elixir_purge_trace_modules(functions: &[TraceFunctionSpec]) -> String {
-    let modules = functions
-        .iter()
-        .map(|function| function.module.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    modules
-        .iter()
-        .map(|module| {
-            // `;` statement separators (not newlines) so the whole wrapped
-            // expression stays on a single line — required for it to
-            // survive a `cmd /c` invocation on Windows, where a newline
-            // terminates the command regardless of quoting.
-            format!(
-                ":code.purge({module}); :code.delete({module}); ",
-                module = elixir_atom(module)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn erlang_purge_trace_modules(functions: &[TraceFunctionSpec]) -> String {
-    let modules = functions
-        .iter()
-        .map(|function| function.module.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    modules
-        .iter()
-        .map(|module| {
-            format!(
-                "code:purge({module}),code:delete({module}),",
-                module = erlang_atom(module)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
 fn erlang_string_list(paths: &[PathBuf]) -> String {
     let values = paths
         .iter()
@@ -5313,48 +5346,12 @@ fn erlang_string_list(paths: &[PathBuf]) -> String {
     format!("[{}]", values.join(","))
 }
 
-fn elixir_string_list(values: &[String]) -> String {
-    let values = values
-        .iter()
-        .map(|value| elixir_charlist(value))
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(", "))
-}
-
 fn erlang_string_vec(values: &[String]) -> String {
     let values = values
         .iter()
         .map(|value| erlang_string(value))
         .collect::<Vec<_>>();
     format!("[{}]", values.join(","))
-}
-
-fn elixir_trace_function_list(functions: &[TraceFunctionSpec]) -> String {
-    let values = functions
-        .iter()
-        .map(|function| {
-            format!(
-                "{{{module}, {name}, {arity}, {kind}, {source_path}, {line}, {manifest_id}, {function_key}, {location_id}, {clause_id}, {resolved_source_path}, {resolved_line}, {resolved_column}, {resolution_strategy}, {trace_copy_path}}}",
-                module = elixir_atom(&function.module),
-                name = elixir_atom(&function.function),
-                arity = function.arity,
-                kind = elixir_charlist(&function.kind),
-                source_path = elixir_charlist(&function.source_path.display().to_string()),
-                line = function.line,
-                manifest_id = elixir_charlist(&function.manifest_id),
-                function_key = elixir_charlist(&function.function_key),
-                location_id = function.location_id,
-                clause_id = function.clause_id,
-                resolved_source_path =
-                    elixir_charlist(&function.resolved_source_path.display().to_string()),
-                resolved_line = function.resolved_line,
-                resolved_column = optional_u32_elixir(function.resolved_column),
-                resolution_strategy = elixir_charlist(&function.resolution_strategy),
-                trace_copy_path = elixir_charlist(&function.trace_copy_path)
-            )
-        })
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(", "))
 }
 
 fn erlang_trace_function_list(functions: &[TraceFunctionSpec]) -> String {
@@ -5384,12 +5381,6 @@ fn erlang_trace_function_list(functions: &[TraceFunctionSpec]) -> String {
     format!("[{}]", values.join(","))
 }
 
-fn optional_u32_elixir(value: Option<u32>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "nil".to_string())
-}
-
 fn optional_u32_erlang(value: Option<u32>) -> String {
     value
         .map(|value| value.to_string())
@@ -5406,30 +5397,15 @@ fn elixir_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn elixir_atom(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-    {
-        format!(":{value}")
-    } else {
-        format!(":\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    }
-}
-
 fn erlang_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn erlang_atom(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
-    }
+    // Elixir-generated names such as __info__ start with an underscore,
+    // which Erlang parses as a variable. Quoting also handles reserved words
+    // and operator names without maintaining a second Erlang lexer here.
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 fn extract_erl_start_function(args: &mut Vec<String>) -> Option<(String, String)> {
@@ -5690,6 +5666,8 @@ struct FixtureSummary {
     event_count: u64,
     first_step: String,
     diagnostic_event: String,
+    /// The reader's `EventLogKind` name for `diagnostic_event`.
+    diagnostic_event_kind: String,
 }
 
 fn write_ctfs_fixture(out_dir: &Path) -> Result<FixtureSummary, Box<dyn Error>> {
@@ -5702,7 +5680,11 @@ fn write_ctfs_fixture(out_dir: &Path) -> Result<FixtureSummary, Box<dyn Error>> 
     writer.start(&source_path, Line(1));
     writer.register_step(&source_path, Line(5));
     writer.register_step(&source_path, Line(6));
-    writer.register_special_event(EventLogKind::Write, "m2", "ctfs writer bridge fixture");
+    writer.register_special_event(
+        EventLogKind::TraceLogEvent,
+        "m2",
+        "ctfs writer bridge fixture",
+    );
     writer.finish_writing_trace_events()?;
     writer.write_meta_dat("codetracer-beam-recorder")?;
     writer.close()?;
@@ -5722,6 +5704,16 @@ fn write_ctfs_fixture(out_dir: &Path) -> Result<FixtureSummary, Box<dyn Error>> 
         return Err(format!("reader saw path_count={path_count}, step_count={step_count}, event_count={event_count}").into());
     }
 
+    let diagnostic_json = reader.event_json(0)?;
+    let diagnostic_event_kind = serde_json::from_str::<serde_json::Value>(&diagnostic_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("kind")
+                .and_then(|kind| kind.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
     Ok(FixtureSummary {
         status: "ok",
         format: "ctfs",
@@ -5735,7 +5727,8 @@ fn write_ctfs_fixture(out_dir: &Path) -> Result<FixtureSummary, Box<dyn Error>> 
         step_count,
         event_count,
         first_step: reader.step_json(0)?,
-        diagnostic_event: decode_nim_event_content(&reader.event_json(0)?),
+        diagnostic_event: decode_nim_event_content(&diagnostic_json),
+        diagnostic_event_kind,
     })
 }
 
@@ -5813,6 +5806,8 @@ struct BundleSummary {
     workdir: String,
     path_count: u64,
     step_count: u64,
+    /// Request entry events decoded by the production CTFS reader.
+    span_entry_steps: Vec<serde_json::Value>,
     event_count: u64,
     thread_start_count_root: u64,
     thread_switch_count_root: u64,
@@ -6078,6 +6073,8 @@ fn read_bundle_summary(
     let mut thread_start_count: u64 = 0;
     let mut thread_switch_count: u64 = 0;
     let mut thread_exit_count: u64 = 0;
+    let mut step_threads = Vec::new();
+    let mut current_thread = RUNTIME_THREAD_ID;
     for index in 0..reader.step_count() {
         let step = reader.step_json(index)?;
         let is_root = step.contains("\"thread_id\":1");
@@ -6087,6 +6084,10 @@ fn read_bundle_summary(
                 thread_start_count_root += 1;
             }
         } else if step.contains("\"kind\":\"thread_switch\"") {
+            let switch: serde_json::Value = serde_json::from_str(&step)?;
+            current_thread = switch["thread_id"]
+                .as_u64()
+                .ok_or("thread switch missing thread id")?;
             thread_switch_count += 1;
             if is_root {
                 thread_switch_count_root += 1;
@@ -6097,7 +6098,34 @@ fn read_bundle_summary(
                 thread_exit_count_root += 1;
             }
         }
+        step_threads.push(current_thread);
     }
+
+    // Stream flags are presence hints: writers may stamp them only at close.
+    // Follow the production readers and recognize stream members structurally
+    // too. Any advertised or partial stream must decode strictly; only a
+    // trace with neither a flag nor any span member has no request entries.
+    let mut container = CtfsReader::open(&ct_path)?;
+    let meta = container.read_file("meta.dat")?;
+    let has_span_members = ["spans.dat", "spans.idx", "spantype.ns"]
+        .iter()
+        .any(|name| container.file_size(name).is_some());
+    let spans: Vec<serde_json::Value> =
+        if read_meta_dat_flags(&meta)? & FLAG_HAS_SPAN_STREAM != 0 || has_span_members {
+            serde_json::from_str(&read_span_stream_json(&ct_path, true)?)?
+        } else {
+            Vec::new()
+        };
+    let span_entry_steps = spans
+        .iter()
+        .map(|span| {
+            let index = span["start_step"].as_u64().ok_or("span entry missing")?;
+            let step: serde_json::Value = serde_json::from_str(&reader.step_json(index)?)?;
+            let (path, line) = reader.step_location(index)?;
+            let location = serde_json::json!({"path": reader.path(path)?, "line": line});
+            Ok(serde_json::json!({"span_id": span["span_id"], "step_index": index, "thread_id": step_threads[index as usize], "step": step, "location": location}))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
 
     let trace_meta_path = bundle_dir.join("trace_meta.json");
     let trace_meta_text = fs::read_to_string(&trace_meta_path).map_err(|error| {
@@ -6386,9 +6414,7 @@ fn read_bundle_summary(
         };
 
         // Recorded program output. The metadata slot carries the stream name
-        // the recorder wrote it under (`stdout` / `stderr`); the CTFS event
-        // kind alone cannot tell them apart, because the container collapses
-        // every write kind onto one coarse `stdout` kind.
+        // the recorder wrote it under (`stdout` / `stderr`).
         let stream = reader
             .event_metadata(index)
             .ok()
@@ -6410,7 +6436,9 @@ fn read_bundle_summary(
             .and_then(|value| value.as_str())
             .unwrap_or_default();
 
-        if kind == Some("error") && schema.contains("exception_from") {
+        // The reader names each kind exactly as trace-events.md
+        // §"EventLogKind (u8 enum)" spells it; an exception is `Error`.
+        if kind == Some("Error") && schema.contains("exception_from") {
             exception_from_count += 1;
             exception_from_records.push(ExceptionFromSummary {
                 schema: schema.to_string(),
@@ -6487,6 +6515,7 @@ fn read_bundle_summary(
         workdir: reader.workdir(),
         path_count: reader.path_count(),
         step_count: reader.step_count(),
+        span_entry_steps,
         event_count: reader.event_count(),
         thread_start_count_root,
         thread_switch_count_root,
@@ -6549,9 +6578,96 @@ fn find_single_ct_file(bundle_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_target_language, is_beam_target, parse_fixture_options, parse_record_options,
-        runtime_compiler_for_target, ParsedRecordCommand, RuntimeCompiler,
+        compile_runtime_app_with, detect_target_language, is_beam_target, parse_fixture_options,
+        parse_record_options, run_beam_tool, runtime_compiler_for_target, ParsedRecordCommand,
+        RuntimeCompiler, RUNTIME_APP_NAME,
     };
+    use std::{fs, io};
+
+    // Only wrapper generation is under test here; RuntimeSession::prepare uses
+    // a non-BEAM command so no compiler/launcher is substituted or mocked.
+    fn wrapper_test_session(out_dir: &std::path::Path) -> super::RuntimeSession {
+        let args = vec![
+            "--out-dir".into(),
+            out_dir.display().to_string(),
+            "--".into(),
+            "sh".into(),
+        ];
+        let ParsedRecordCommand::Record(options) = parse_record_options(args).unwrap() else {
+            panic!("expected record options");
+        };
+        let mut runtime = super::RuntimeSession::prepare(&options).unwrap();
+        runtime.mode = super::RuntimeMode::Beam;
+        runtime.runtime_ebin = Some(out_dir.join("runtime_ebin"));
+        runtime.instrumented_ebin = Some(out_dir.join("instrumented_ebin"));
+        runtime
+    }
+
+    #[test]
+    fn runtime_wrapper_size_does_not_grow_with_functions_or_modules() {
+        let mut runtime = wrapper_test_session(std::path::Path::new("/tmp/wrapper-options"));
+        let wrappers = |runtime: &super::RuntimeSession| {
+            [
+                super::wrap_elixir_expression("Example.main()", runtime),
+                super::wrap_erlang_entrypoint("example", "main", "[]", runtime),
+                super::wrap_rebar3_shell_eval("example:main().", runtime),
+            ]
+        };
+        let initial_lengths = wrappers(&runtime).map(|wrapper| wrapper.len());
+        for index in 0..1000 {
+            runtime
+                .trace_functions
+                .push(super::trace_function_spec(super::TraceFunctionInput {
+                    source_root: std::path::Path::new("/tmp"),
+                    source_maps: &[],
+                    module: &format!("module_{index}"),
+                    function: "main",
+                    arity: 0,
+                    kind: "erlang",
+                    source_path: std::path::Path::new("/tmp/project/src/example.erl"),
+                    line: 1,
+                }));
+        }
+        assert!(super::erlang_runtime_options(&runtime).len() > 131_072);
+        assert_eq!(
+            wrappers(&runtime).map(|wrapper| wrapper.len()),
+            initial_lengths
+        );
+    }
+
+    #[test]
+    fn runtime_options_are_written_completely_and_write_errors_are_bootstrap_errors() {
+        let out_dir = std::env::temp_dir().join(format!(
+            "beam-runtime-options-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&out_dir).unwrap();
+        let runtime = wrapper_test_session(&out_dir);
+        let args = ["--", "mix", "run", "-e", "IO.puts(:ok)"].map(String::from);
+        let ParsedRecordCommand::Record(options) = parse_record_options(args.to_vec()).unwrap()
+        else {
+            panic!("expected record options");
+        };
+        runtime.prepare_target(&options).unwrap();
+        let options_path = runtime.runtime_options_path();
+        assert_eq!(
+            fs::read_to_string(&options_path).unwrap(),
+            format!("{}.\n", super::erlang_runtime_options(&runtime))
+        );
+        fs::remove_file(&options_path).unwrap();
+        fs::create_dir(&options_path).unwrap();
+        let error = runtime.prepare_target(&options).unwrap_err();
+        assert_eq!(error.code, "runtime_bootstrap_failed");
+        assert!(error
+            .detail
+            .unwrap()
+            .contains(&options_path.display().to_string()));
+        fs::remove_dir_all(out_dir).unwrap();
+    }
 
     /// The five launch commands this recorder claims to instrument, and the
     /// source language each one implies. `elixir` and `escript` are the two
@@ -6699,5 +6815,54 @@ mod tests {
         let options = parse_fixture_options(vec!["--out-dir".into(), "/tmp/trace".into()]).unwrap();
 
         assert_eq!(options.out_dir, std::path::PathBuf::from("/tmp/trace"));
+    }
+
+    /// A BEAM tool that cannot be started is reported by name. A bare
+    /// "No such file or directory (os error 2)" names neither the program nor
+    /// the PATH it was looked up in, and a recording that failed that way
+    /// could not be traced back to a missing `erlc`.
+    #[test]
+    fn a_beam_tool_that_cannot_start_is_named_in_the_error() {
+        let error = run_beam_tool("codetracer-no-such-beam-tool", &["-version"])
+            .expect_err("a program that does not exist cannot start");
+        let message = error.to_string();
+        assert!(
+            message.contains("codetracer-no-such-beam-tool"),
+            "the error must name the program: {message}"
+        );
+        assert!(
+            message.contains("PATH"),
+            "the error must say where it was looked up: {message}"
+        );
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::NotFound,
+            "the kind is preserved"
+        );
+    }
+
+    /// The runtime build names the file it could not read or write.
+    #[test]
+    fn a_runtime_build_into_an_unusable_directory_names_the_path() {
+        let scratch = std::env::temp_dir().join(format!("ct-beam-runtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).unwrap();
+        // A FILE where the runtime's build directory has to go.
+        let blocker = scratch.join("runtime");
+        fs::write(&blocker, b"not a directory").unwrap();
+        let error = compile_runtime_app_with(&scratch, RuntimeCompiler::Erlc)
+            .expect_err("the build directory cannot be created under a file");
+        let message = error.to_string();
+        let _ = fs::remove_dir_all(&scratch);
+        assert!(
+            message.contains(
+                &blocker
+                    .join(RUNTIME_APP_NAME)
+                    .join("ebin")
+                    .display()
+                    .to_string()
+            ),
+            "the error must name the directory it could not create: {message}"
+        );
     }
 }

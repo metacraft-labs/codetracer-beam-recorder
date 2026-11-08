@@ -1,0 +1,6 @@
+# Cross-repo siblings CI clones to ../<name>, through setup-dev-env /
+# clone-siblings, at the revisions this commit's repro.lock pins.
+# Cargo.toml path-depends on codetracer-trace-format, and its
+# codetracer_trace_writer_nim build script compiles codetracer-trace-format-nim.
+codetracer-trace-format
+codetracer-trace-format-nim
