@@ -946,14 +946,48 @@ bind_variables(File, Pid, ThreadId, Bindings, State0 = #state{pid_frames = PidFr
             State#state{pid_frames = maps:put(PidText, [Frame | Rest], State#state.pid_frames)}
     end.
 
-bind_variable(
+bind_variable(File, PidText, ThreadId, {Slot, CompiledName, Value}, Frame, State)
+        when is_integer(Slot), is_list(CompiledName) ->
+    case source_variable_name(maps:get(source_language, Frame, "erlang"), CompiledName) of
+        generated ->
+            {Frame, State};
+        Name ->
+            bind_named_variable(File, PidText, ThreadId, {Slot, Name, Value}, Frame, State)
+    end;
+bind_variable(_File, _PidText, _ThreadId, _Binding, Frame, State) ->
+    {Frame, State}.
+
+%% The name a variable has in the program's SOURCE. An Elixir module is
+%% instrumented as the Erlang the Elixir compiler emits, whose variables are
+%% `elixir_erl_var`'s: `_<name>@<version>` for a source variable `<name>`
+%% (`a` is `_a@1`, its rebinding `_a@2`, `_x` is `__x@1`) and `__@<n>` for
+%% one the compiler made itself. A trace that wrote the compiled names showed
+%% every front-end `_a@1` where the program says `a`; the source name is
+%% written instead, and a compiler-made variable is not a program variable at
+%% all. Erlang's own variables are their source names already.
+source_variable_name("elixir", [$_ | Rest]) ->
+    case string:split(Rest, "@", trailing) of
+        [Base, Version] when Base =/= "", Base =/= "_" ->
+            case string:to_integer(Version) of
+                {N, ""} when is_integer(N) -> Base;
+                _ -> [$_ | Rest]
+            end;
+        [Base, _Version] when Base =:= ""; Base =:= "_" ->
+            generated;
+        _ ->
+            [$_ | Rest]
+    end;
+source_variable_name(_SourceLanguage, Name) ->
+    Name.
+
+bind_named_variable(
     File,
     PidText,
     ThreadId,
     {Slot, Name, Value},
     Frame,
     State = #state{next_runtime_variable_id = NextVariableId}
-) when is_integer(Slot), is_list(Name) ->
+) ->
     FrameId = maps:get(frame_id, Frame),
     FunctionKey = maps:get(function_key, Frame, undefined),
     SlotTemplate = slot_template(FunctionKey, Slot),
@@ -982,9 +1016,7 @@ bind_variable(
             NewFrame = Frame#{variables => Variables},
             ok = write_variable_bind(File, PidText, ThreadId, FrameId, VariableInfo, Value),
             {NewFrame, State}
-    end;
-bind_variable(_File, _PidText, _ThreadId, _Binding, Frame, State) ->
-    {Frame, State}.
+    end.
 
 slot_template(undefined, Slot) ->
     "unknown#" ++ integer_to_list(Slot);

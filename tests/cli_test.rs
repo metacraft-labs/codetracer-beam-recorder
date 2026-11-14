@@ -193,7 +193,7 @@ fn e2e_elixir_exception_flow_matrix() {
     assert!(
         event_payloads.iter().any(|payload| {
             payload.contains("codetracer.beam.variable-binding.v1")
-                && payload.contains("_final_total@")
+                && payload.contains("\"name\":\"final_total\"")
         }) && event_payloads.iter().any(|payload| {
             payload.contains("codetracer.beam.source-location.v1")
                 && payload.contains("Elixir.ExceptionFlow")
@@ -1586,11 +1586,6 @@ fn assert_reader_value(pairs: &[(String, i64)], name: &str, value: i64) {
     );
 }
 
-fn normalized_elixir_variable_name(name: &str) -> &str {
-    let stripped = name.strip_prefix('_').unwrap_or(name);
-    stripped.split('@').next().unwrap_or(stripped)
-}
-
 fn sidecar_elixir_binding_values<'a>(binds: &'a [Value], source_name: &str) -> Vec<&'a Value> {
     binds
         .iter()
@@ -1598,7 +1593,7 @@ fn sidecar_elixir_binding_values<'a>(binds: &'a [Value], source_name: &str) -> V
             event["source_language"] == "elixir"
                 && event["name"]
                     .as_str()
-                    .is_some_and(|name| normalized_elixir_variable_name(name) == source_name)
+                    .is_some_and(|name| *name == *source_name)
         })
         .map(|event| &event["value"])
         .collect()
@@ -1610,7 +1605,7 @@ fn assert_sidecar_elixir_binding(binds: &[Value], source_name: &str, value: i64)
             event["source_language"] == "elixir"
                 && event["name"]
                     .as_str()
-                    .is_some_and(|name| normalized_elixir_variable_name(name) == source_name)
+                    .is_some_and(|name| *name == *source_name)
                 && reader_value_int(&event["value"]) == Some(value)
                 && event["frame_id"].as_u64().is_some()
                 && event["runtime_variable_id"].as_u64().is_some()
@@ -1700,7 +1695,7 @@ fn assert_sidecar_elixir_raw_type_binding(
 fn assert_reader_elixir_value(pairs: &[(String, i64)], source_name: &str, value: i64) {
     assert!(
         pairs.iter().any(|(observed_name, observed_value)| {
-            normalized_elixir_variable_name(observed_name) == source_name
+            *observed_name == *source_name
                 && *observed_value == value
         }),
         "missing CTFS reader Elixir value {source_name}={value}: {pairs:#?}"
@@ -1715,7 +1710,7 @@ fn assert_raw_elixir_value(
 ) {
     let matches = values
         .iter()
-        .filter(|(observed_name, _)| normalized_elixir_variable_name(observed_name) == source_name)
+        .filter(|(observed_name, _)| *observed_name == *source_name)
         .map(|(_, value)| value)
         .collect::<Vec<_>>();
     assert!(
@@ -1731,7 +1726,7 @@ fn find_elixir_named_value<'a>(
     values
         .iter()
         .rev()
-        .find(|(observed_name, _)| normalized_elixir_variable_name(observed_name) == source_name)
+        .find(|(observed_name, _)| *observed_name == *source_name)
         .map(|(_, value)| value)
         .unwrap_or_else(|| panic!("missing raw CTFS Elixir value for {source_name}: {values:#?}"))
 }
@@ -1842,6 +1837,34 @@ fn e2e_runtime_session_records_real_elixir_process() {
         "mix.ct",
         "Mix M4 injection",
         "lib/canonical_flow.ex",
+    );
+}
+
+/// An Elixir program's variables are named as its source names them. The
+/// instrumented Erlang the Elixir compiler emits calls `a` `_a@1` (and makes
+/// variables of its own, `__@1`); the trace must carry `a`, or every
+/// front-end shows `_a@1` where `canonical_flow.ex` says `a`.
+#[test]
+fn e2e_elixir_variables_carry_their_source_names() {
+    let recorded = record_elixir_expression("elixir-source-names", "CanonicalFlow.main()");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    let names = events
+        .iter()
+        .filter(|event| event["event"] == "variable_bind" && event["source_language"] == "elixir")
+        .filter_map(|event| event["name"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    for expected in ["a", "b", "sum_val", "doubled", "final_result", "result"] {
+        assert!(names.iter().any(|name| name == expected), "no binding named {expected}: {names:?}");
+    }
+    assert!(
+        names.iter().all(|name| !name.contains('@')),
+        "a compiled Elixir variable name reached the trace: {names:?}"
     );
 }
 
