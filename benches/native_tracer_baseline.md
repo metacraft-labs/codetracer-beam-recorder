@@ -27,5 +27,4 @@ Notes:
   expected to widen the gap.
 - Event_count counts trace events (excluding the trace_delivered
   summary line and any manifest_loaded headers).
-- Run `just test-integration` (or `elixir tests/integration/native_tracer_bench_test.exs`)
-  to refresh this baseline.
+- Run `just update-bench-baseline` to refresh this baseline.

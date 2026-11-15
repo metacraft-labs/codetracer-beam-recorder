@@ -6,17 +6,24 @@ defmodule CodetracerBeamRecorder.NativeTracerBenchTest do
   @moduledoc """
   M16 benchmark verification: runs the three M16 benchmark fixtures
   (call-heavy, process-heavy, message-heavy) through both the
-  `process` and `native` tracer backends and records wall-clock results
-  to `benches/native_tracer_baseline.md`. The test asserts that *all
-  six* runs completed without recorder errors and that the baseline
-  file was written; it deliberately does *not* assert on relative
-  performance numbers — the goal in M16 is to capture a baseline,
-  not to optimize.
+  `process` and `native` tracer backends and writes the wall-clock
+  results as a baseline in the format of the committed
+  `benches/native_tracer_baseline.md`. The test asserts that *all six*
+  runs completed without recorder errors and that the baseline file was
+  written; it deliberately does *not* assert on relative performance
+  numbers — the goal in M16 is to capture a baseline, not to optimize.
+
+  An ordinary run writes the baseline to a scratch directory, so running
+  the suite never modifies a tracked file (the timings differ on every
+  run and every host). The committed baseline is refreshed only on
+  request: `just update-bench-baseline` sets
+  `CODETRACER_BEAM_BENCH_BASELINE_OUT` to
+  `benches/native_tracer_baseline.md`, and the test writes there instead.
   """
 
   @repo_root Path.expand("../..", __DIR__)
   @bench_fixture Path.join(@repo_root, "test-programs/erlang/native_tracer_bench")
-  @baseline_path Path.join(@repo_root, "benches/native_tracer_baseline.md")
+  @committed_baseline_path Path.join(@repo_root, "benches/native_tracer_baseline.md")
   @fixtures [
     {"call_heavy", "call-heavy (1000-iter recursive sum)"},
     {"process_heavy", "process-heavy (200 short-lived spawns)"},
@@ -28,7 +35,8 @@ defmodule CodetracerBeamRecorder.NativeTracerBenchTest do
     ebin_dir = tmp_dir!("bench-ebin")
     compile_bench_fixture!(ebin_dir)
 
-    File.mkdir_p!(Path.dirname(@baseline_path))
+    baseline_path = baseline_path!()
+    File.mkdir_p!(Path.dirname(baseline_path))
 
     rows =
       for {entry, label} <- @fixtures, backend <- @backends do
@@ -63,14 +71,14 @@ defmodule CodetracerBeamRecorder.NativeTracerBenchTest do
         }
       end
 
-    write_baseline!(rows)
+    write_baseline!(baseline_path, rows)
 
-    assert File.exists?(@baseline_path),
-           "benchmark baseline must be written to #{@baseline_path}"
+    assert File.exists?(baseline_path),
+           "benchmark baseline must be written to #{baseline_path}"
 
     # Sanity check: the baseline file must mention every (fixture, backend)
     # pairing.
-    body = File.read!(@baseline_path)
+    body = File.read!(baseline_path)
 
     for {entry, _label} <- @fixtures, backend <- @backends do
       assert body =~ entry,
@@ -118,7 +126,19 @@ defmodule CodetracerBeamRecorder.NativeTracerBenchTest do
     end)
   end
 
-  defp write_baseline!(rows) do
+  # Where this run writes its baseline: the path named by
+  # CODETRACER_BEAM_BENCH_BASELINE_OUT (`just update-bench-baseline` names
+  # the committed benches/native_tracer_baseline.md), otherwise a file in a fresh
+  # scratch directory.
+  defp baseline_path! do
+    case System.get_env("CODETRACER_BEAM_BENCH_BASELINE_OUT") do
+      nil -> Path.join(tmp_dir!("bench-baseline"), Path.basename(@committed_baseline_path))
+      "" -> flunk("CODETRACER_BEAM_BENCH_BASELINE_OUT is set but empty")
+      path -> Path.expand(path)
+    end
+  end
+
+  defp write_baseline!(baseline_path, rows) do
     timestamp = DateTime.utc_now() |> DateTime.to_iso8601()
 
     header = """
@@ -156,11 +176,10 @@ defmodule CodetracerBeamRecorder.NativeTracerBenchTest do
       expected to widen the gap.
     - Event_count counts trace events (excluding the trace_delivered
       summary line and any manifest_loaded headers).
-    - Run `just test-integration` (or `elixir tests/integration/native_tracer_bench_test.exs`)
-      to refresh this baseline.
+    - Run `just update-bench-baseline` to refresh this baseline.
     """
 
-    File.write!(@baseline_path, [header, body, notes])
+    File.write!(baseline_path, [header, body, notes])
   end
 
   defp recorder_binary! do

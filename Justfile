@@ -146,6 +146,14 @@ verify-release-check-no-silent-skip:
 release-check:
   bash scripts/release-check.sh
 
+# Refresh the committed M16 benchmark baseline. `just test` runs the same
+# benchmark but writes its baseline to a scratch directory, so a test run
+# never modifies a tracked file; this recipe is the one way to update
+# benches/native_tracer_baseline.md, and its diff is committed on purpose.
+update-bench-baseline:
+  cargo build --locked
+  CODETRACER_BEAM_BENCH_BASELINE_OUT="$PWD/benches/native_tracer_baseline.md" {{exunit_timeout_prelude}} tests/integration/native_tracer_bench_test.exs
+
 # --- RS-M8: Request Panel demo + fixture ---
 
 # Record a real Elixir web session and (unless CODETRACER_DEMO_RECORD_ONLY is
