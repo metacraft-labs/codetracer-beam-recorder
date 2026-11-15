@@ -1695,8 +1695,7 @@ fn assert_sidecar_elixir_raw_type_binding(
 fn assert_reader_elixir_value(pairs: &[(String, i64)], source_name: &str, value: i64) {
     assert!(
         pairs.iter().any(|(observed_name, observed_value)| {
-            *observed_name == *source_name
-                && *observed_value == value
+            *observed_name == *source_name && *observed_value == value
         }),
         "missing CTFS reader Elixir value {source_name}={value}: {pairs:#?}"
     );
@@ -1860,7 +1859,10 @@ fn e2e_elixir_variables_carry_their_source_names() {
         .filter_map(|event| event["name"].as_str().map(str::to_string))
         .collect::<Vec<_>>();
     for expected in ["a", "b", "sum_val", "doubled", "final_result", "result"] {
-        assert!(names.iter().any(|name| name == expected), "no binding named {expected}: {names:?}");
+        assert!(
+            names.iter().any(|name| name == expected),
+            "no binding named {expected}: {names:?}"
+        );
     }
     assert!(
         names.iter().all(|name| !name.contains('@')),
