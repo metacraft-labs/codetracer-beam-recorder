@@ -49,10 +49,11 @@
 ## ``verify-*-no-silent-skip.sh`` gates). Those spin up a live BEAM VM
 ## and drive ``elixir`` / ``mix`` / ``erl`` / ``erlc`` / ``rebar3``
 ## against real OTP applications. The nix dev shell (``flake.nix``)
-## already provisions the whole BEAM toolchain — ``erlang`` (``erl`` /
-## ``erlc``), ``elixir`` (``mix``), and ``rebar3`` — on ``PATH``, exactly
-## as ``just test`` consumes them, so these suites need no additional
-## reprobuild toolchain package. They are therefore modelled below as
+## provisions the whole BEAM toolchain — ``erlang`` (``erl`` / ``erlc`` /
+## ``escript``), ``elixir`` (``elixirc`` / ``mix``), and ``rebar3`` — on
+## ``PATH``, exactly as ``just test`` consumes them; ``uses:`` declares
+## each of those executables and the edges below attach them. They are
+## therefore modelled below as
 ## ``sh.shell`` execute edges enrolled into the ``test`` collection,
 ## mirroring how the cairo / leo recorders model their non-cargo
 ## verification steps: the canonical-flow fixtures
@@ -109,11 +110,17 @@
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
 ## canonical Rust-recorder recipes: the nix dev shell puts ``cargo`` /
-## ``rustc`` / ``nim`` / ``nimble`` / ``capnp`` / ``jq`` / ``erlang`` /
-## ``elixir`` / ``rebar3`` / ``zstd`` on ``PATH`` (and
-## ``PKG_CONFIG_PATH`` for libzstd), so the weak-local PATH resolver is
-## the right default. Without it ``repro build`` refuses to run with
-## "typed tool provisioning is required for uses declarations".
+## ``rustc`` / ``nim`` / ``nimble`` / ``capnp`` / ``jq`` / ``zstd`` and
+## the BEAM toolchain (``erl`` / ``erlc`` / ``escript`` from Erlang/OTP,
+## ``elixir`` / ``elixirc`` / ``mix`` from Elixir, ``rebar3``) on
+## ``PATH`` (and ``PKG_CONFIG_PATH`` for libzstd), so the weak-local PATH
+## resolver is the right default. Every one of those tools is declared in
+## ``uses:`` under the name of the executable an edge runs, so a
+## path-mode resolution probes ``PATH`` for exactly that binary, and the
+## edges that run them carry their identities (see "Tool identities" at
+## the end of the ``build:`` block). Without the provisioning default
+## ``repro build`` refuses to run with "typed tool provisioning is
+## required for uses declarations".
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
@@ -207,23 +214,33 @@ package codetracer_beam_recorder:
     "mktemp"
     "dirname"
     "rm"
+    # The canonical-flow fixture scripts and ``prepare-web-fixtures.sh``
+    # set ``MIX_ENV`` / ``MIX_BUILD_ROOT`` through ``env``.
+    "env"
+    # ``deep_call_nesting_test`` kills a recorder that overran its bound
+    # (and the BEAM it launched) with ``pkill -P`` and ``kill``.
+    "pkill"
+    "kill"
 
-    # NB: the BEAM/OTP runtime (``erl`` / ``erlc`` / ``elixir`` / ``mix``
-    # / ``rebar3``) is NOT declared here. The standard library's
-    # ``erlang`` and ``elixir`` packages provision Windows archives only,
-    # ``erlang`` maps to no ``erl`` executable (a PATH probe looks for an
-    # ``erlang`` binary, which OTP does not ship), and there is no
-    # ``mix`` / ``erlc`` / ``escript`` / ``rebar3`` package at all, so
-    # declaring them would only add a failing PATH probe.
-    # These tools are runtime dependencies of the spawned cargo test
-    # process (``tests/cli_test.rs`` ``e2e_*`` compile+record real Erlang
-    # and Elixir programs), of the golden-contract shell script, and of
-    # the BEAM/OTP integration ``sh.shell`` edges below (the
-    # canonical-flow fixtures and the thirteen live-BEAM Elixir suites drive
-    # ``mix`` / ``elixir`` / ``erl`` / ``erlc`` / ``rebar3`` as child
-    # processes); they are supplied to those child processes by the same
-    # nix dev shell PATH the flake provides — exactly as ``just test``
-    # runs them today.
+    # BEAM toolchain, one package per executable an edge runs. Under
+    # ``defaultToolProvisioning "path"`` each name is probed on PATH as
+    # that binary, which the nix dev shell supplies. They are run by the
+    # cargo test run (``tests/cli_test.rs`` compiles and records real
+    # Erlang and Elixir programs through ``erl`` / ``erlc`` / ``elixirc``
+    # / ``mix`` / ``rebar3``), the two canonical-flow fixtures (``mix``,
+    # ``erlc`` / ``erl``) and the live-BEAM integration suites, which run
+    # under ``elixir`` and drive the recorder against every launcher it
+    # supports (``erl``, ``escript``, ``rebar3``, ``elixir``, ``mix``;
+    # ``launch_targets_test`` also requires ``elixirc``). The recorder
+    # itself compiles its Erlang runtime with ``erlc`` or, for an Elixir
+    # target, ``elixir -e``. ``iex`` is not declared: nothing runs it.
+    "erl"
+    "erlc"
+    "escript"
+    "elixir"
+    "elixirc"
+    "mix"
+    "rebar3"
 
   executable codetracerBeamRecorder:
     name: "codetracer-beam-recorder"
@@ -334,9 +351,9 @@ package codetracer_beam_recorder:
     # the fifteen ``verify-*-no-silent-skip.sh`` structural gates. Each is
     # a native ``sh.shell`` edge under the engine's automatic monitor, so
     # the real ``elixir`` / ``mix`` / ``erl`` / ``erlc`` / ``rebar3``
-    # subprocesses (inherited from the nix dev-shell PATH) are observed —
-    # mirroring how the cairo / leo recorders model non-cargo verification
-    # steps.
+    # subprocesses (the ``uses:`` tools attached to each edge under "Tool
+    # identities" below) are observed — mirroring how the cairo / leo
+    # recorders model non-cargo verification steps.
 
     # Debug recorder build for the integration edges: ``just
     # test-integration`` builds the DEBUG profile (``cargo build
@@ -487,6 +504,10 @@ package codetracer_beam_recorder:
       "Application.put_env(:ex_unit, :timeout, " &
       $monitoredExUnitTimeoutMs & ")' -r "
 
+    proc integrationActionId(t: string): string =
+      "codetracer-beam-recorder.integration-" & t
+    var integrationEdges: seq[BuildActionDef] = @[]
+
     for t in beamIntegrationTests:
       # Heavy live-BEAM edges → routed through the capacity-1 serial pool so
       # they do not race ExUnit's timeout under contention, AND given a
@@ -502,13 +523,13 @@ package codetracer_beam_recorder:
           "bash scripts/prepare-web-fixtures.sh && "
         else:
           ""
-      beamEdges.add pooledShell(
+      let integrationEdge = pooledShell(
         command =
           prepare &
           "CODETRACER_BEAM_RECORDER_BIN=\"$PWD/" & recorderDebugBinary &
           "\" " & exUnitTimeoutPrelude & "tests/integration/" & t & ".exs",
         pool = beamSerialPool,
-        actionId = "codetracer-beam-recorder.integration-" & t,
+        actionId = integrationActionId(t),
         after = @[recorderDebugBuild],
         extraInputs = @[
           "tests/integration/" & t & ".exs",
@@ -516,6 +537,8 @@ package codetracer_beam_recorder:
           "lib", "test-programs", "mix.exs", "rebar3_codetracer",
           recorderDebugBinary],
         cacheable = false)
+      beamEdges.add integrationEdge
+      integrationEdges.add integrationEdge
 
     # The nineteen ``verify-*-no-silent-skip.sh`` structural gates: pure
     # ``sh`` + ``grep`` assertions that the integration test files and
@@ -562,28 +585,55 @@ package codetracer_beam_recorder:
     # are not on the actions' PATH at all.
     #
     # Attaching an identity also narrows the action's PATH to the attached
-    # tools. That is why the edges that run the BEAM toolchain -- the cargo
-    # test run (``tests/cli_test.rs`` compiles and records real Erlang and
-    # Elixir programs), the two canonical-flow fixtures and the live-BEAM
-    # integration suites -- carry none yet: ``erl`` / ``erlc`` / ``elixir``
-    # / ``mix`` / ``rebar3`` cannot be declared (see the note at the end of
-    # ``uses:``), so those edges still take every tool from the dev-shell
-    # PATH, and attaching only the declarable ones would hide the BEAM
-    # toolchain from them.
+    # tools, so each edge carries the whole set its process tree runs:
+    #
+    # * the cargo builds: the cargo toolchain and the C compiler driver;
+    # * the cargo test run: the same, since ``cargo test`` re-checks the
+    #   build it runs, plus ``sh`` (the shell-target tests record
+    #   ``sh -c``) and the BEAM toolchain ``tests/cli_test.rs`` drives;
+    # * the canonical-flow fixtures: the shell tools their scripts call,
+    #   plus ``mix`` / ``elixir`` or ``erlc`` / ``erl``;
+    # * every live-BEAM integration suite: the shell tools and the whole
+    #   BEAM toolchain (the suites run under ``elixir`` and drive the
+    #   recorder through each launcher). ``ctfs_writer_bridge_test`` also
+    #   runs ``cargo run``, so it carries the cargo toolchain, and
+    #   ``deep_call_nesting_test`` carries ``pkill`` / ``kill`` for its
+    #   overrun cleanup;
+    # * the golden-contract check, the CLI smoke edge (whose recorded
+    #   target is ``sh -c``) and the structural gates: the shell tools,
+    #   plus ``jq`` for the golden contract. None of them runs a BEAM tool.
     const cargoToolRefs = ["cargo", "rustc", "nim", "nimble", "git", "capnp",
                            "pkg-config", "zstd"]
     const shellToolRefs = ["sh", "bash", "grep", "sed", "awk", "cut", "head",
-                           "tail", "cat", "mkdir", "mktemp", "dirname", "rm"]
-    for action in [recorderBuild.id, recorderDebugBuild.id,
-                   testsBuild.action.id]:
+                           "tail", "cat", "mkdir", "mktemp", "dirname", "rm",
+                           "env"]
+    const beamToolRefs = ["erl", "erlc", "escript", "elixir", "elixirc", "mix",
+                          "rebar3"]
+    proc attachCargoToolchain(action: string) =
       appendRegisteredActionToolIdentityRefs(action, cargoToolRefs)
       when defined(linux):
         appendRegisteredActionToolIdentityRefs(action, ["gcc"])
       elif defined(macosx):
         appendRegisteredActionToolIdentityRefs(action, ["clang"])
-    for action in @[goldenVerify, cliSmoke] & gateEdges:
+
+    for action in [recorderBuild.id, recorderDebugBuild.id,
+                   testsBuild.action.id, testsRun.action.id]:
+      attachCargoToolchain(action)
+    appendRegisteredActionToolIdentityRefs(testsRun.action.id, ["sh"])
+    appendRegisteredActionToolIdentityRefs(testsRun.action.id, beamToolRefs)
+
+    for action in @[goldenVerify] & gateEdges & beamEdges:
       appendRegisteredActionToolIdentityRefs(action.id, shellToolRefs)
     appendRegisteredActionToolIdentityRefs(goldenVerify.id, ["jq"])
+    appendRegisteredActionToolIdentityRefs(elixirCanonicalFlow.id,
+                                           ["elixir", "mix"])
+    appendRegisteredActionToolIdentityRefs(erlangCanonicalFlow.id,
+                                           ["erl", "erlc"])
+    for action in integrationEdges:
+      appendRegisteredActionToolIdentityRefs(action.id, beamToolRefs)
+    attachCargoToolchain(integrationActionId("ctfs_writer_bridge_test"))
+    appendRegisteredActionToolIdentityRefs(
+      integrationActionId("deep_call_nesting_test"), ["pkill", "kill"])
 
     discard collect("test",
       @[testsRun.action, goldenVerify] & beamEdges & gateEdges)

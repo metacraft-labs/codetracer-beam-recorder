@@ -148,13 +148,50 @@ defmodule CodetracerBeamRecorder.SpanStreamHelpers do
   @doc "A span's metadata keys, in the order they were emitted."
   def meta_keys(span), do: Enum.map(span["metadata"], fn [key, _value] -> key end)
 
+  @doc """
+  A fresh scratch directory, named after `label`, with every symlink in its
+  path resolved.
+
+  The web demos use these directories as `MIX_BUILD_ROOT`. Mix links each
+  Rebar dependency's `include/` into the build root with a RELATIVE symlink
+  that it computes from the path as given, without resolving symlinks. On
+  macOS the temporary directory is under `/tmp`, itself a symlink to
+  `private/tmp`, so that link resolves one directory short and the dependency
+  cannot find its own headers (cowlib: `can't find include file
+  "cow_inline.hrl"`). A build root with no symlinks in its path gets a link
+  that resolves. On Linux, where `/tmp` is a real directory, the path is
+  unchanged.
+  """
   def tmp_dir!(label) do
     nonce = System.unique_integer([:positive])
     stamp = System.system_time(:nanosecond)
-    path = Path.join(System.tmp_dir!(), "codetracer-beam-recorder-#{label}-#{stamp}-#{nonce}")
+
+    path =
+      Path.join(
+        resolve_symlinks!(System.tmp_dir!()),
+        "codetracer-beam-recorder-#{label}-#{stamp}-#{nonce}"
+      )
+
     File.rm_rf!(path)
     File.mkdir_p!(path)
     path
+  end
+
+  # Resolves every symlink in `path`, one component at a time, like
+  # realpath(3). `depth` bounds the number of links followed, so a symlink
+  # cycle raises instead of looping.
+  defp resolve_symlinks!(path, depth \\ 0) do
+    if depth > 40, do: raise("too many levels of symbolic links resolving #{path}")
+    [root | parts] = Path.split(Path.expand(path))
+
+    Enum.reduce(parts, root, fn part, resolved ->
+      candidate = Path.join(resolved, part)
+
+      case :file.read_link_all(candidate) do
+        {:ok, target} -> resolve_symlinks!(Path.expand(to_string(target), resolved), depth + 1)
+        {:error, _not_a_link} -> candidate
+      end
+    end)
   end
 
   # Tiny JSON decoder, same shape as the one in plug_smoke_test.exs /
